@@ -111,6 +111,46 @@ type eventRow struct {
 	UpdatedAt      time.Time
 }
 
+type taskRequest struct {
+	Title          string   `json:"title"`
+	Description    string   `json:"description"`
+	Category       string   `json:"category"`
+	Priority       string   `json:"priority"`
+	DueAt          string   `json:"due_at"`
+	ChecklistItems []string `json:"checklist_titles"`
+}
+
+type taskChecklistCreateRequest struct {
+	Title string `json:"title"`
+}
+
+type taskChecklistUpdateRequest struct {
+	IsDone bool `json:"is_done"`
+}
+
+type taskRow struct {
+	ID          int64
+	UserID      int64
+	Title       string
+	Description string
+	Category    string
+	Priority    string
+	DueAt       sql.NullTime
+	CompletedAt sql.NullTime
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type taskChecklistRow struct {
+	ID        int64
+	TaskID    int64
+	Title     string
+	IsDone    bool
+	Position  int
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+
 type gamificationSummary struct {
 	XP              int    `json:"xp"`
 	Level           int    `json:"level"`
@@ -178,6 +218,14 @@ func main() {
 	secured.Put("/events/:id", appCtx.handleUpdateEvent)
 	secured.Delete("/events/:id", appCtx.handleDeleteEvent)
 	secured.Post("/events/:id/complete", appCtx.handleCompleteEvent)
+	secured.Post("/tasks", appCtx.handleCreateTask)
+	secured.Get("/tasks", appCtx.handleListTasks)
+	secured.Get("/tasks/:id", appCtx.handleGetTask)
+	secured.Put("/tasks/:id", appCtx.handleUpdateTask)
+	secured.Delete("/tasks/:id", appCtx.handleDeleteTask)
+	secured.Post("/tasks/:id/checklist", appCtx.handleAddTaskChecklistItem)
+	secured.Patch("/tasks/:id/checklist/:itemId", appCtx.handleUpdateTaskChecklistItem)
+	secured.Delete("/tasks/:id/checklist/:itemId", appCtx.handleDeleteTaskChecklistItem)
 	secured.Get("/gamification/summary", appCtx.handleGetGamificationSummary)
 	secured.Get("/gamification/achievements", appCtx.handleGetAchievements)
 
@@ -296,6 +344,30 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			deleted_at TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_events_user_start ON events (user_id, start_at) WHERE deleted_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS tasks (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			category TEXT NOT NULL DEFAULT 'Geral',
+			priority TEXT NOT NULL DEFAULT 'medium',
+			due_at TIMESTAMPTZ,
+			completed_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			deleted_at TIMESTAMPTZ
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_user_priority_due ON tasks (user_id, priority, due_at) WHERE deleted_at IS NULL`,
+		`CREATE TABLE IF NOT EXISTS task_checklist_items (
+			id BIGSERIAL PRIMARY KEY,
+			task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			is_done BOOLEAN NOT NULL DEFAULT FALSE,
+			position INTEGER NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_checklist_task_position ON task_checklist_items (task_id, position, id)`,
 		`CREATE TABLE IF NOT EXISTS reminder_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1228,6 +1300,566 @@ func (a *appContext) handleCompleteEvent(c *fiber.Ctx) error {
 		Unlocked:   []fiber.Map{},
 		WasAlready: true,
 	})
+}
+
+func (a *appContext) handleCreateTask(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	var req taskRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	title, description, category, priority, dueAt, checklistItems, err := validateTaskRequest(req)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var row taskRow
+	err = tx.QueryRow(ctx, `
+		INSERT INTO tasks (user_id, title, description, category, priority, due_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+		RETURNING id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
+	`, userID, title, description, category, priority, dueAt).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create task"})
+	}
+
+	for idx, itemTitle := range checklistItems {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO task_checklist_items (task_id, title, position)
+			VALUES ($1, $2, $3)
+		`, row.ID, itemTitle, idx); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create checklist items"})
+		}
+	}
+
+	if err := a.refreshTaskCompletion(ctx, tx, row.ID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate task completion"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit task creation"})
+	}
+
+	response, err := a.loadTaskResponse(ctx, userID, row.ID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(response)
+}
+
+func (a *appContext) handleListTasks(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	page := parsePositiveInt(c.Query("page"), 1)
+	limit := parsePositiveInt(c.Query("limit"), 20)
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	var total int
+	err := a.db.QueryRow(ctx, `
+		SELECT COUNT(*)
+		FROM tasks
+		WHERE user_id = $1 AND deleted_at IS NULL
+	`, userID).Scan(&total)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not count tasks"})
+	}
+
+	rows, err := a.db.Query(ctx, `
+		SELECT id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
+		FROM tasks
+		WHERE user_id = $1 AND deleted_at IS NULL
+		ORDER BY
+			CASE priority
+				WHEN 'urgent' THEN 4
+				WHEN 'high' THEN 3
+				WHEN 'medium' THEN 2
+				ELSE 1
+			END DESC,
+			due_at ASC NULLS LAST,
+			created_at DESC
+		LIMIT $2 OFFSET $3
+	`, userID, limit, offset)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list tasks"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row taskRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse task row"})
+		}
+		taskResp, err := a.loadTaskResponse(ctx, userID, row.ID)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load checklist"})
+		}
+		items = append(items, taskResp)
+	}
+
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+
+	return c.JSON(fiber.Map{
+		"tasks": items,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+	})
+}
+
+func (a *appContext) handleGetTask(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	response, err := a.loadTaskResponse(ctx, userID, taskID)
+	if err != nil {
+		if strings.Contains(err.Error(), "not found") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.JSON(response)
+}
+
+func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+
+	var req taskRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	title, description, category, priority, dueAt, _, err := validateTaskRequest(req)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	res, err := a.db.Exec(ctx, `
+		UPDATE tasks
+		SET title = $1,
+			description = $2,
+			category = $3,
+			priority = $4,
+			due_at = $5,
+			updated_at = NOW()
+		WHERE id = $6 AND user_id = $7 AND deleted_at IS NULL
+	`, title, description, category, priority, dueAt, taskID, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update task"})
+	}
+	if res.RowsAffected() == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+	}
+
+	response, err := a.loadTaskResponse(ctx, userID, taskID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.JSON(response)
+}
+
+func (a *appContext) handleDeleteTask(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	res, err := a.db.Exec(ctx, `
+		UPDATE tasks
+		SET deleted_at = NOW(), updated_at = NOW()
+		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+	`, taskID, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not delete task"})
+	}
+	if res.RowsAffected() == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+	}
+
+	return c.SendStatus(fiber.StatusNoContent)
+}
+
+func (a *appContext) handleAddTaskChecklistItem(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+
+	var req taskChecklistCreateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if len(title) < 2 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "title must be at least 2 characters"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var exists bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM tasks
+			WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+		)
+	`, taskID, userID).Scan(&exists)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not validate task"})
+	}
+	if !exists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+	}
+
+	var nextPosition int
+	err = tx.QueryRow(ctx, `
+		SELECT COALESCE(MAX(position), -1) + 1
+		FROM task_checklist_items
+		WHERE task_id = $1
+	`, taskID).Scan(&nextPosition)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate checklist position"})
+	}
+
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO task_checklist_items (task_id, title, position)
+		VALUES ($1, $2, $3)
+	`, taskID, title, nextPosition); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create checklist item"})
+	}
+
+	if err := a.refreshTaskCompletion(ctx, tx, taskID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate task completion"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit checklist creation"})
+	}
+
+	response, err := a.loadTaskResponse(ctx, userID, taskID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(response)
+}
+
+func (a *appContext) handleUpdateTaskChecklistItem(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+	itemID, err := strconv.ParseInt(c.Params("itemId"), 10, 64)
+	if err != nil || itemID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid checklist item id"})
+	}
+
+	var req taskChecklistUpdateRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := tx.Exec(ctx, `
+		UPDATE task_checklist_items AS i
+		SET is_done = $1,
+			updated_at = NOW()
+		FROM tasks t
+		WHERE i.id = $2
+			AND i.task_id = $3
+			AND t.id = i.task_id
+			AND t.user_id = $4
+			AND t.deleted_at IS NULL
+	`, req.IsDone, itemID, taskID, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update checklist item"})
+	}
+	if res.RowsAffected() == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "checklist item not found"})
+	}
+
+	if err := a.refreshTaskCompletion(ctx, tx, taskID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate task completion"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit checklist update"})
+	}
+
+	response, err := a.loadTaskResponse(ctx, userID, taskID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.JSON(response)
+}
+
+func (a *appContext) handleDeleteTaskChecklistItem(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	taskID, err := strconv.ParseInt(c.Params("id"), 10, 64)
+	if err != nil || taskID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid task id"})
+	}
+	itemID, err := strconv.ParseInt(c.Params("itemId"), 10, 64)
+	if err != nil || itemID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid checklist item id"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	res, err := tx.Exec(ctx, `
+		DELETE FROM task_checklist_items AS i
+		USING tasks t
+		WHERE i.id = $1
+			AND i.task_id = $2
+			AND t.id = i.task_id
+			AND t.user_id = $3
+			AND t.deleted_at IS NULL
+	`, itemID, taskID, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not delete checklist item"})
+	}
+	if res.RowsAffected() == 0 {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "checklist item not found"})
+	}
+
+	if err := a.refreshTaskCompletion(ctx, tx, taskID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate task completion"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit checklist deletion"})
+	}
+
+	response, err := a.loadTaskResponse(ctx, userID, taskID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
+	}
+
+	return c.JSON(response)
+}
+
+func validateTaskRequest(req taskRequest) (string, string, string, string, interface{}, []string, error) {
+	title := strings.TrimSpace(req.Title)
+	if len(title) < 3 {
+		return "", "", "", "", nil, nil, errors.New("title must be at least 3 characters")
+	}
+
+	description := strings.TrimSpace(req.Description)
+	category := strings.TrimSpace(req.Category)
+	if category == "" {
+		category = "Geral"
+	}
+
+	priority := strings.ToLower(strings.TrimSpace(req.Priority))
+	if priority == "" {
+		priority = "medium"
+	}
+	if priority != "low" && priority != "medium" && priority != "high" && priority != "urgent" {
+		return "", "", "", "", nil, nil, errors.New("priority must be low, medium, high or urgent")
+	}
+
+	var dueAt interface{} = nil
+	dueText := strings.TrimSpace(req.DueAt)
+	if dueText != "" {
+		parsed, err := time.Parse(time.RFC3339, dueText)
+		if err != nil {
+			return "", "", "", "", nil, nil, errors.New("due_at must be RFC3339")
+		}
+		dueAt = parsed.UTC()
+	}
+
+	items := make([]string, 0, len(req.ChecklistItems))
+	for _, item := range req.ChecklistItems {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		items = append(items, trimmed)
+	}
+
+	return title, description, category, priority, dueAt, items, nil
+}
+
+func (a *appContext) refreshTaskCompletion(ctx context.Context, tx pgx.Tx, taskID int64) error {
+	var total int
+	var done int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*), COUNT(*) FILTER (WHERE is_done)
+		FROM task_checklist_items
+		WHERE task_id = $1
+	`, taskID).Scan(&total, &done); err != nil {
+		return err
+	}
+
+	if total > 0 && done == total {
+		_, err := tx.Exec(ctx, `
+			UPDATE tasks
+			SET completed_at = COALESCE(completed_at, NOW()), updated_at = NOW()
+			WHERE id = $1
+		`, taskID)
+		return err
+	}
+
+	_, err := tx.Exec(ctx, `
+		UPDATE tasks
+		SET completed_at = NULL, updated_at = NOW()
+		WHERE id = $1
+	`, taskID)
+	return err
+}
+
+func (a *appContext) loadTaskResponse(ctx context.Context, userID int64, taskID int64) (fiber.Map, error) {
+	var row taskRow
+	err := a.db.QueryRow(ctx, `
+		SELECT id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
+		FROM tasks
+		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+	`, taskID, userID).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return nil, errors.New("task not found")
+		}
+		return nil, err
+	}
+
+	checklistRows, err := a.loadTaskChecklist(ctx, row.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	return taskRowToResponse(row, checklistRows), nil
+}
+
+func (a *appContext) loadTaskChecklist(ctx context.Context, taskID int64) ([]taskChecklistRow, error) {
+	rows, err := a.db.Query(ctx, `
+		SELECT id, task_id, title, is_done, position, created_at, updated_at
+		FROM task_checklist_items
+		WHERE task_id = $1
+		ORDER BY position ASC, id ASC
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]taskChecklistRow, 0)
+	for rows.Next() {
+		var row taskChecklistRow
+		if err := rows.Scan(&row.ID, &row.TaskID, &row.Title, &row.IsDone, &row.Position, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, row)
+	}
+
+	return items, nil
+}
+
+func taskRowToResponse(row taskRow, checklist []taskChecklistRow) fiber.Map {
+	items := make([]fiber.Map, 0, len(checklist))
+	doneCount := 0
+	for _, item := range checklist {
+		if item.IsDone {
+			doneCount++
+		}
+		items = append(items, fiber.Map{
+			"id":         item.ID,
+			"task_id":    item.TaskID,
+			"title":      item.Title,
+			"is_done":    item.IsDone,
+			"position":   item.Position,
+			"created_at": item.CreatedAt.UTC().Format(time.RFC3339),
+			"updated_at": item.UpdatedAt.UTC().Format(time.RFC3339),
+		})
+	}
+
+	progressPercent := 0
+	if len(checklist) > 0 {
+		progressPercent = int(float64(doneCount) / float64(len(checklist)) * 100.0)
+	}
+
+	return fiber.Map{
+		"id":               row.ID,
+		"user_id":          row.UserID,
+		"title":            row.Title,
+		"description":      row.Description,
+		"category":         row.Category,
+		"priority":         row.Priority,
+		"due_at":           nullableTimeRFC3339(row.DueAt),
+		"completed_at":     nullableTimeRFC3339(row.CompletedAt),
+		"checklist":        items,
+		"progress_percent": progressPercent,
+		"created_at":       row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":       row.UpdatedAt.UTC().Format(time.RFC3339),
+	}
 }
 
 func (a *appContext) handleGetGamificationSummary(c *fiber.Ctx) error {

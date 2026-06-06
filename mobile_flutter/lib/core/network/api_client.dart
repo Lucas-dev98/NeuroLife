@@ -43,6 +43,14 @@ class ApiClient {
     return request('DELETE', path, requiresAuth: requiresAuth);
   }
 
+  Future<http.Response> patch(
+    String path, {
+    Map<String, dynamic>? body,
+    bool requiresAuth = false,
+  }) {
+    return request('PATCH', path, body: body, requiresAuth: requiresAuth);
+  }
+
   Future<http.Response> request(
     String method,
     String path, {
@@ -68,18 +76,34 @@ class ApiClient {
         case 'GET':
           return _client.get(uri, headers: headers);
         case 'POST':
-          return _client.post(uri, headers: headers, body: body == null ? null : jsonEncode(body));
+          return _client.post(
+            uri,
+            headers: headers,
+            body: body == null ? null : jsonEncode(body),
+          );
         case 'PUT':
-          return _client.put(uri, headers: headers, body: body == null ? null : jsonEncode(body));
+          return _client.put(
+            uri,
+            headers: headers,
+            body: body == null ? null : jsonEncode(body),
+          );
         case 'DELETE':
           return _client.delete(uri, headers: headers);
+        case 'PATCH':
+          return _client.patch(
+            uri,
+            headers: headers,
+            body: body == null ? null : jsonEncode(body),
+          );
         default:
           throw ApiException('Metodo HTTP nao suportado: $method');
       }
     }
 
     var response = await send();
-    if (requiresAuth && response.statusCode == 401 && refreshAccessToken != null) {
+    if (requiresAuth &&
+        response.statusCode == 401 &&
+        refreshAccessToken != null) {
       await refreshAccessToken!.call();
       response = await send();
     }

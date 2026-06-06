@@ -28,7 +28,9 @@ class _TasksPageState extends State<TasksPage> {
                 Expanded(
                   child: Text(
                     'Tarefas',
-                    style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
                   ),
                 ),
                 FilledButton.icon(
@@ -40,7 +42,7 @@ class _TasksPageState extends State<TasksPage> {
             ),
             const SizedBox(height: 8),
             Text(
-              'Tarefas locais com checklist manual e progresso salvo no aparelho.',
+              'Tarefas e checklist sincronizados com o backend.',
               style: Theme.of(context).textTheme.bodyMedium,
             ),
             const SizedBox(height: 16),
@@ -53,8 +55,10 @@ class _TasksPageState extends State<TasksPage> {
                   onEdit: () => _openTaskDialog(context, existingTask: task),
                   onDelete: () => _deleteTask(context, task),
                   onAddChecklistItem: () => _addChecklistItem(context, task),
-                  onToggleChecklistItem: (itemId) => widget.controller.toggleChecklistItem(task.id, itemId),
-                  onDeleteChecklistItem: (itemId) => widget.controller.deleteChecklistItem(task.id, itemId),
+                  onToggleChecklistItem: (itemId) =>
+                      widget.controller.toggleChecklistItem(task.id, itemId),
+                  onDeleteChecklistItem: (itemId) =>
+                      widget.controller.deleteChecklistItem(task.id, itemId),
                 ),
           ],
         );
@@ -62,7 +66,10 @@ class _TasksPageState extends State<TasksPage> {
     );
   }
 
-  Future<void> _openTaskDialog(BuildContext context, {TaskItem? existingTask}) async {
+  Future<void> _openTaskDialog(
+    BuildContext context, {
+    TaskItem? existingTask,
+  }) async {
     final draft = await showDialog<TaskDraft>(
       context: context,
       builder: (dialogContext) => _TaskDialog(existingTask: existingTask),
@@ -80,7 +87,8 @@ class _TasksPageState extends State<TasksPage> {
   }
 
   Future<void> _deleteTask(BuildContext context, TaskItem task) async {
-    final confirmed = await showDialog<bool>(
+    final confirmed =
+        await showDialog<bool>(
           context: context,
           builder: (dialogContext) => AlertDialog(
             title: const Text('Excluir tarefa'),
@@ -121,7 +129,8 @@ class _TasksPageState extends State<TasksPage> {
             child: const Text('Cancelar'),
           ),
           FilledButton(
-            onPressed: () => Navigator.of(dialogContext).pop(titleController.text),
+            onPressed: () =>
+                Navigator.of(dialogContext).pop(titleController.text),
             child: const Text('Adicionar'),
           ),
         ],
@@ -151,8 +160,8 @@ class _TaskCard extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onAddChecklistItem;
-  final void Function(String checklistItemId) onToggleChecklistItem;
-  final void Function(String checklistItemId) onDeleteChecklistItem;
+  final void Function(int checklistItemId) onToggleChecklistItem;
+  final void Function(int checklistItemId) onDeleteChecklistItem;
 
   @override
   Widget build(BuildContext context) {
@@ -177,14 +186,23 @@ class _TaskCard extends StatelessWidget {
                     color: const Color(0x110E5A8A),
                     borderRadius: BorderRadius.circular(12),
                   ),
-                  child: const Icon(Icons.checklist_rounded, color: Color(0xFF0E5A8A)),
+                  child: const Icon(
+                    Icons.checklist_rounded,
+                    color: Color(0xFF0E5A8A),
+                  ),
                 ),
                 const SizedBox(width: 12),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(task.title, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 16)),
+                      Text(
+                        task.title,
+                        style: const TextStyle(
+                          fontWeight: FontWeight.w700,
+                          fontSize: 16,
+                        ),
+                      ),
                       const SizedBox(height: 4),
                       Text(_buildMeta(task)),
                     ],
@@ -213,7 +231,9 @@ class _TaskCard extends StatelessWidget {
               Text(task.description),
             ],
             const SizedBox(height: 12),
-            LinearProgressIndicator(value: task.progress == 0 ? 0.02 : task.progress),
+            LinearProgressIndicator(
+              value: task.progress == 0 ? 0.02 : task.progress,
+            ),
             const SizedBox(height: 6),
             Text('$percent% concluido'),
             const SizedBox(height: 12),
@@ -258,7 +278,9 @@ class _TaskCard extends StatelessWidget {
   }
 
   String _buildMeta(TaskItem task) {
-    final due = task.dueAt == null ? 'Sem prazo' : _formatDate(task.dueAt!.toLocal());
+    final due = task.dueAt == null
+        ? 'Sem prazo'
+        : _formatDate(task.dueAt!.toLocal());
     return '${task.category} • ${task.priority.toUpperCase()} • $due';
   }
 
@@ -282,15 +304,24 @@ class _EmptyTaskCard extends StatelessWidget {
         color: Colors.white,
         borderRadius: BorderRadius.circular(18),
         boxShadow: const [
-          BoxShadow(color: Color(0x14000000), blurRadius: 16, offset: Offset(0, 6)),
+          BoxShadow(
+            color: Color(0x14000000),
+            blurRadius: 16,
+            offset: Offset(0, 6),
+          ),
         ],
       ),
       child: const Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Nenhuma tarefa criada ainda', style: TextStyle(fontWeight: FontWeight.w700)),
+          Text(
+            'Nenhuma tarefa criada ainda',
+            style: TextStyle(fontWeight: FontWeight.w700),
+          ),
           SizedBox(height: 4),
-          Text('Crie tarefas com checklist manual para organizar a execucao em passos pequenos.'),
+          Text(
+            'Crie tarefas com checklist manual para organizar a execucao em passos pequenos.',
+          ),
         ],
       ),
     );
@@ -321,8 +352,12 @@ class _TaskDialogState extends State<_TaskDialog> {
     super.initState();
     final existing = widget.existingTask;
     _titleController = TextEditingController(text: existing?.title ?? '');
-    _descriptionController = TextEditingController(text: existing?.description ?? '');
-    _categoryController = TextEditingController(text: existing?.category ?? 'Geral');
+    _descriptionController = TextEditingController(
+      text: existing?.description ?? '',
+    );
+    _categoryController = TextEditingController(
+      text: existing?.category ?? 'Geral',
+    );
     _checklistController = TextEditingController();
     _priority = existing?.priority ?? 'medium';
     _dueAt = existing?.dueAt?.toLocal();
@@ -377,7 +412,13 @@ class _TaskDialogState extends State<_TaskDialog> {
     }
 
     setState(() {
-      _dueAt = DateTime(pickedDate.year, pickedDate.month, pickedDate.day, pickedTime.hour, pickedTime.minute);
+      _dueAt = DateTime(
+        pickedDate.year,
+        pickedDate.month,
+        pickedDate.day,
+        pickedTime.hour,
+        pickedTime.minute,
+      );
     });
   }
 
@@ -443,13 +484,16 @@ class _TaskDialogState extends State<_TaskDialog> {
                   DropdownMenuItem(value: 'high', child: Text('Alta')),
                   DropdownMenuItem(value: 'urgent', child: Text('Urgente')),
                 ],
-                onChanged: (value) => setState(() => _priority = value ?? 'medium'),
+                onChanged: (value) =>
+                    setState(() => _priority = value ?? 'medium'),
               ),
               const SizedBox(height: 12),
               ListTile(
                 contentPadding: EdgeInsets.zero,
                 title: const Text('Prazo'),
-                subtitle: Text(_dueAt == null ? 'Sem prazo' : _formatDate(_dueAt!)),
+                subtitle: Text(
+                  _dueAt == null ? 'Sem prazo' : _formatDate(_dueAt!),
+                ),
                 trailing: const Icon(Icons.event_rounded),
                 onTap: _pickDueDate,
               ),
@@ -476,7 +520,8 @@ class _TaskDialogState extends State<_TaskDialog> {
                       for (final item in _checklistTitles)
                         Chip(
                           label: Text(item),
-                          onDeleted: () => setState(() => _checklistTitles.remove(item)),
+                          onDeleted: () =>
+                              setState(() => _checklistTitles.remove(item)),
                         ),
                     ],
                   ),

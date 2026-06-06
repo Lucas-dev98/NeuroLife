@@ -25,8 +25,12 @@ class _HomePageState extends State<HomePage> {
   @override
   void initState() {
     super.initState();
-    _homeController = HomeController(apiClient: widget.authController.apiClient);
-    _taskBoardController = TaskBoardController();
+    _homeController = HomeController(
+      apiClient: widget.authController.apiClient,
+    );
+    _taskBoardController = TaskBoardController(
+      apiClient: widget.authController.apiClient,
+    );
     _taskBoardController!.load();
     _homeController.load();
   }
@@ -50,7 +54,8 @@ class _HomePageState extends State<HomePage> {
       animation: _homeController,
       builder: (context, _) {
         final profile = _homeController.profile;
-        final taskBoardController = _taskBoardController ??= TaskBoardController();
+        final taskBoardController = _taskBoardController ??=
+            TaskBoardController(apiClient: widget.authController.apiClient);
         final pages = [
           _DashboardTab(controller: _homeController),
           AgendaPage(controller: _homeController),
@@ -60,11 +65,15 @@ class _HomePageState extends State<HomePage> {
 
         return Scaffold(
           appBar: AppBar(
-            title: Text('NeuroLife • ${profile?.name ?? widget.authController.user?.name ?? 'Usuario'}'),
+            title: Text(
+              'NeuroLife • ${profile?.name ?? widget.authController.user?.name ?? 'Usuario'}',
+            ),
             actions: [
               IconButton(
                 tooltip: 'Atualizar',
-                onPressed: _homeController.isLoading ? null : _homeController.load,
+                onPressed: _homeController.isLoading
+                    ? null
+                    : _homeController.load,
                 icon: const Icon(Icons.refresh_rounded),
               ),
               IconButton(
@@ -85,10 +94,22 @@ class _HomePageState extends State<HomePage> {
             selectedIndex: _index,
             onDestinationSelected: (value) => setState(() => _index = value),
             destinations: const [
-              NavigationDestination(icon: Icon(Icons.grid_view_rounded), label: 'Visao geral'),
-              NavigationDestination(icon: Icon(Icons.event_note_rounded), label: 'Agenda'),
-              NavigationDestination(icon: Icon(Icons.checklist_rounded), label: 'Tarefas'),
-              NavigationDestination(icon: Icon(Icons.person_rounded), label: 'Perfil'),
+              NavigationDestination(
+                icon: Icon(Icons.grid_view_rounded),
+                label: 'Visao geral',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.event_note_rounded),
+                label: 'Agenda',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.checklist_rounded),
+                label: 'Tarefas',
+              ),
+              NavigationDestination(
+                icon: Icon(Icons.person_rounded),
+                label: 'Perfil',
+              ),
             ],
           ),
         );
@@ -105,11 +126,15 @@ class _HomeBody extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (controller.isLoading && controller.profile == null && controller.summary == null) {
+    if (controller.isLoading &&
+        controller.profile == null &&
+        controller.summary == null) {
       return const Center(child: CircularProgressIndicator());
     }
 
-    if (controller.errorMessage != null && controller.profile == null && controller.summary == null) {
+    if (controller.errorMessage != null &&
+        controller.profile == null &&
+        controller.summary == null) {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
@@ -118,10 +143,7 @@ class _HomeBody extends StatelessWidget {
             children: [
               const Icon(Icons.cloud_off_rounded, size: 36),
               const SizedBox(height: 12),
-              Text(
-                controller.errorMessage!,
-                textAlign: TextAlign.center,
-              ),
+              Text(controller.errorMessage!, textAlign: TextAlign.center),
               const SizedBox(height: 12),
               ElevatedButton(
                 onPressed: controller.load,
@@ -161,24 +183,30 @@ class _DashboardTab extends StatelessWidget {
         _QuickTile(
           icon: Icons.event_available_rounded,
           title: 'Eventos proximos',
-          subtitle: nextEvents.isEmpty ? 'Nenhum evento carregado.' : '${nextEvents.length} eventos nos proximos dias.',
+          subtitle: nextEvents.isEmpty
+              ? 'Nenhum evento carregado.'
+              : '${nextEvents.length} eventos nos proximos dias.',
         ),
         _QuickTile(
           icon: Icons.local_fire_department_rounded,
           title: 'Sequencia ativa',
-          subtitle: '${summary?.currentStreak ?? 0} dias seguidos com consistencia.',
+          subtitle:
+              '${summary?.currentStreak ?? 0} dias seguidos com consistencia.',
         ),
         _QuickTile(
           icon: Icons.workspace_premium_rounded,
           title: 'Conquistas desbloqueadas',
-          subtitle: '${controller.achievements.length} marcos registrados no seu perfil.',
+          subtitle:
+              '${controller.achievements.length} marcos registrados no seu perfil.',
         ),
         if (controller.errorMessage != null)
           Padding(
             padding: const EdgeInsets.only(top: 8),
             child: Text(
               controller.errorMessage!,
-              style: Theme.of(context).textTheme.bodySmall?.copyWith(color: Theme.of(context).colorScheme.error),
+              style: Theme.of(context).textTheme.bodySmall?.copyWith(
+                color: Theme.of(context).colorScheme.error,
+              ),
             ),
           ),
       ],
@@ -207,17 +235,34 @@ class _HeroCard extends StatelessWidget {
         ),
         borderRadius: BorderRadius.circular(22),
         boxShadow: const [
-          BoxShadow(color: Color(0x280E5A8A), blurRadius: 22, offset: Offset(0, 8)),
+          BoxShadow(
+            color: Color(0x280E5A8A),
+            blurRadius: 22,
+            offset: Offset(0, 8),
+          ),
         ],
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Bom te ver de novo', style: TextStyle(color: Colors.white70, fontSize: 14)),
+          Text(
+            'Bom te ver de novo',
+            style: TextStyle(color: Colors.white70, fontSize: 14),
+          ),
           SizedBox(height: 6),
-          Text(name, style: TextStyle(color: Colors.white, fontSize: 24, fontWeight: FontWeight.w800)),
+          Text(
+            name,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: 24,
+              fontWeight: FontWeight.w800,
+            ),
+          ),
           SizedBox(height: 12),
-          Text('Nivel $level • Sequencia atual de $streak dias.', style: TextStyle(color: Colors.white70)),
+          Text(
+            'Nivel $level • Sequencia atual de $streak dias.',
+            style: TextStyle(color: Colors.white70),
+          ),
         ],
       ),
     );
@@ -233,13 +278,19 @@ class _SectionTitle extends StatelessWidget {
   Widget build(BuildContext context) {
     return Text(
       text,
-      style: Theme.of(context).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
+      style: Theme.of(
+        context,
+      ).textTheme.titleLarge?.copyWith(fontWeight: FontWeight.w800),
     );
   }
 }
 
 class _QuickTile extends StatelessWidget {
-  const _QuickTile({required this.icon, required this.title, required this.subtitle});
+  const _QuickTile({
+    required this.icon,
+    required this.title,
+    required this.subtitle,
+  });
 
   final IconData icon;
   final String title;
@@ -262,7 +313,10 @@ class _QuickTile extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                Text(title, style: const TextStyle(fontWeight: FontWeight.w700)),
+                Text(
+                  title,
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
                 const SizedBox(height: 2),
                 Text(subtitle),
               ],
