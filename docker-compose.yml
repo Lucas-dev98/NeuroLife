@@ -1,0 +1,172 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-neurolife}
+      POSTGRES_USER: ${POSTGRES_USER:-neurolife}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neurolife}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-neurolife} -d ${POSTGRES_DB:-neurolife}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-neurolife}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-neurolife}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio_data:/data
+
+  ai-service:
+    build:
+      context: ./services/ai-python
+    environment:
+      PORT: ${AI_SERVICE_PORT:-8000}
+    ports:
+      - "${AI_SERVICE_PORT:-18000}:8000"
+
+  gateway:
+    build:
+      context: ./services/gateway-go
+    environment:
+      PORT: ${GATEWAY_PORT:-8080}
+      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-me}
+      ACCESS_TOKEN_TTL_MINUTES: ${ACCESS_TOKEN_TTL_MINUTES:-30}
+      REFRESH_TOKEN_TTL_HOURS: ${REFRESH_TOKEN_TTL_HOURS:-720}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      MINIO_HOST: minio
+      MINIO_PORT: 9000
+      AI_SERVICE_URL: http://ai-service:8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      minio:
+        condition: service_started
+      ai-service:
+        condition: service_started
+    ports:
+      - "${GATEWAY_PORT:-18080}:8080"
+
+  outbox-worker:
+    build:
+      context: ./services/gateway-go
+    command: ["/usr/local/bin/gateway-worker"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-neurolife}
+      POSTGRES_USER: ${POSTGRES_USER:-neurolife}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neurolife}
+      POSTGRES_SSLMODE: disable
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-neurolife}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-neurolife}
+      RABBITMQ_REMINDER_QUEUE: ${RABBITMQ_REMINDER_QUEUE:-reminder.triggered}
+      OUTBOX_POLL_SECONDS: ${OUTBOX_POLL_SECONDS:-2}
+      OUTBOX_BATCH_SIZE: ${OUTBOX_BATCH_SIZE:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notifier-consumer:
+    build:
+      context: ./services/gateway-go
+    command: ["/usr/local/bin/notifier-consumer"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-neurolife}
+      POSTGRES_USER: ${POSTGRES_USER:-neurolife}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neurolife}
+      POSTGRES_SSLMODE: disable
+      RABBITMQ_HOST: rabbitmq
+      RABBITMQ_PORT: 5672
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:-neurolife}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:-neurolife}
+      RABBITMQ_REMINDER_QUEUE: ${RABBITMQ_REMINDER_QUEUE:-reminder.triggered}
+      CONSUMER_PREFETCH: ${CONSUMER_PREFETCH:-50}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+
+  notifier-dispatcher:
+    build:
+      context: ./services/gateway-go
+    command: ["/usr/local/bin/notifier-dispatcher"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-neurolife}
+      POSTGRES_USER: ${POSTGRES_USER:-neurolife}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-neurolife}
+      POSTGRES_SSLMODE: disable
+      DISPATCHER_POLL_SECONDS: ${DISPATCHER_POLL_SECONDS:-2}
+      DISPATCHER_BATCH_SIZE: ${DISPATCHER_BATCH_SIZE:-50}
+      DISPATCH_FAIL_CHANNELS: ${DISPATCH_FAIL_CHANNELS:-}
+      DISPATCH_CHANNEL_MODE: ${DISPATCH_CHANNEL_MODE:-mixed}
+      FCM_ENDPOINT: ${FCM_ENDPOINT:-}
+      FCM_AUTH_BEARER: ${FCM_AUTH_BEARER:-}
+      FCM_DEFAULT_TOKEN: ${FCM_DEFAULT_TOKEN:-}
+      FCM_TIMEOUT_SECONDS: ${FCM_TIMEOUT_SECONDS:-8}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      WHATSAPP_API_URL: ${WHATSAPP_API_URL:-}
+      WHATSAPP_API_TOKEN: ${WHATSAPP_API_TOKEN:-}
+      WHATSAPP_DEFAULT_TO: ${WHATSAPP_DEFAULT_TO:-}
+      WHATSAPP_TIMEOUT_SECONDS: ${WHATSAPP_TIMEOUT_SECONDS:-8}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  minio_data:

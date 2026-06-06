@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://neurolife.local/schemas/reminder.triggered.schema.json",
+  "title": "ReminderTriggeredMessage",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "version",
+    "topic",
+    "action",
+    "source",
+    "produced_at",
+    "outbox_id",
+    "event_type",
+    "user_id",
+    "event_id",
+    "title",
+    "timezone",
+    "start_at",
+    "end_at",
+    "is_all_day",
+    "offset_minutes",
+    "trigger_at",
+    "target_channels",
+    "correlation_id"
+  ],
+  "properties": {
+    "version": { "type": "string", "const": "1.0" },
+    "topic": { "type": "string", "const": "reminder.triggered" },
+    "action": { "type": "string", "enum": ["upsert", "delete"] },
+    "source": { "type": "string" },
+    "produced_at": { "type": "string", "format": "date-time" },
+    "outbox_id": { "type": "integer", "minimum": 1 },
+    "event_type": { "type": "string", "enum": ["event.created", "event.updated", "event.deleted"] },
+    "user_id": { "type": "integer", "minimum": 1 },
+    "event_id": { "type": "integer", "minimum": 1 },
+    "title": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "timezone": { "type": "string", "minLength": 1 },
+    "start_at": { "type": "string", "format": "date-time" },
+    "end_at": { "type": "string", "format": "date-time" },
+    "is_all_day": { "type": "boolean" },
+    "offset_minutes": { "type": "integer", "minimum": 0 },
+    "trigger_at": { "type": "string", "format": "date-time" },
+    "target_channels": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "enum": ["push", "email", "whatsapp"] }
+    },
+    "correlation_id": { "type": "string", "minLength": 1 }
+  }
+}
