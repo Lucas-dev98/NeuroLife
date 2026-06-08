@@ -360,9 +360,9 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			deleted_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS depends_on_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_user_priority_due ON tasks (user_id, priority, due_at) WHERE deleted_at IS NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_user_dependency ON tasks (user_id, depends_on_task_id) WHERE deleted_at IS NULL`,
-		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS depends_on_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL`,
 		`CREATE TABLE IF NOT EXISTS task_checklist_items (
 			id BIGSERIAL PRIMARY KEY,
 			task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
