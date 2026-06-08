@@ -24,6 +24,7 @@ type reminderTriggeredMessage struct {
 	EventType      string   `json:"event_type"`
 	UserID         int64    `json:"user_id"`
 	EventID        int64    `json:"event_id"`
+	TaskID         int64    `json:"task_id"`
 	Title          string   `json:"title"`
 	Description    string   `json:"description,omitempty"`
 	Timezone       string   `json:"timezone"`
@@ -79,7 +80,8 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			topic TEXT NOT NULL,
 			action TEXT NOT NULL,
 			user_id BIGINT NOT NULL,
-			event_id BIGINT NOT NULL,
+			event_id BIGINT,
+			task_id BIGINT,
 			title TEXT NOT NULL,
 			description TEXT NOT NULL DEFAULT '',
 			timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -93,7 +95,10 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			canceled_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS task_id BIGINT`,
+		`ALTER TABLE notification_schedule ALTER COLUMN event_id DROP NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_status_trigger ON notification_schedule (status, trigger_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_task_status_trigger ON notification_schedule (task_id, status, trigger_at)`,
 	}
 
 	for _, q := range queries {
@@ -111,7 +116,7 @@ func handleMessage(ctx context.Context, db *pgxpool.Pool, raw []byte) error {
 		return fmt.Errorf("invalid json payload: %w", err)
 	}
 
-	if msg.CorrelationID == "" || msg.UserID <= 0 || msg.EventID <= 0 {
+	if msg.CorrelationID == "" || msg.UserID <= 0 || (msg.EventID <= 0 && msg.TaskID <= 0) {
 		return fmt.Errorf("invalid required fields")
 	}
 
@@ -137,6 +142,18 @@ func handleMessage(ctx context.Context, db *pgxpool.Pool, raw []byte) error {
 	defer cancel()
 
 	if msg.Action == "delete" {
+		if msg.TaskID > 0 {
+			_, err = db.Exec(ctxDB, `
+				UPDATE notification_schedule
+				SET status = 'canceled',
+				    canceled_at = NOW(),
+				    updated_at = NOW()
+				WHERE task_id = $1
+				  AND status IN ('scheduled', 'queued')
+			`, msg.TaskID)
+			return err
+		}
+
 		_, err = db.Exec(ctxDB, `
 			UPDATE notification_schedule
 			SET status = 'canceled',
@@ -150,19 +167,21 @@ func handleMessage(ctx context.Context, db *pgxpool.Pool, raw []byte) error {
 
 	_, err = db.Exec(ctxDB, `
 		INSERT INTO notification_schedule (
-			correlation_id, status, topic, action, user_id, event_id,
+			correlation_id, status, topic, action, user_id, event_id, task_id,
 			title, description, timezone, start_at, end_at,
 			trigger_at, offset_minutes, target_channels
 		)
 		VALUES (
-			$1, 'scheduled', $2, $3, $4, $5,
-			$6, $7, $8, $9, $10,
-			$11, $12, $13::jsonb
+			$1, 'scheduled', $2, $3, $4, $5, $6,
+			$7, $8, $9, $10, $11,
+			$12, $13, $14::jsonb
 		)
 		ON CONFLICT (correlation_id)
 		DO UPDATE SET
 			status = 'scheduled',
 			action = EXCLUDED.action,
+			event_id = EXCLUDED.event_id,
+			task_id = EXCLUDED.task_id,
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
 			timezone = EXCLUDED.timezone,
@@ -174,7 +193,7 @@ func handleMessage(ctx context.Context, db *pgxpool.Pool, raw []byte) error {
 			last_error = NULL,
 			updated_at = NOW(),
 			canceled_at = NULL
-	`, msg.CorrelationID, msg.Topic, msg.Action, msg.UserID, msg.EventID, msg.Title, msg.Description, defaultTZ(msg.Timezone), startAt.UTC(), endAt.UTC(), triggerAt.UTC(), msg.OffsetMinutes, string(channelsJSON))
+	`, msg.CorrelationID, msg.Topic, msg.Action, msg.UserID, nullableID(msg.EventID), nullableID(msg.TaskID), msg.Title, msg.Description, defaultTZ(msg.Timezone), startAt.UTC(), endAt.UTC(), triggerAt.UTC(), msg.OffsetMinutes, string(channelsJSON))
 	if err != nil {
 		return err
 	}
@@ -292,4 +311,11 @@ func envOrInt(key string, fallback int) int {
 		return fallback
 	}
 	return n
+}
+
+func nullableID(v int64) interface{} {
+	if v <= 0 {
+		return nil
+	}
+	return v
 }

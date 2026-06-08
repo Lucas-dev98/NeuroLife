@@ -23,6 +23,22 @@ class TaskChecklistItem {
   }
 }
 
+class TaskReminderPreview {
+  const TaskReminderPreview({
+    required this.id,
+    required this.triggerAt,
+    required this.offsetMinutes,
+    required this.channels,
+    required this.status,
+  });
+
+  final int id;
+  final DateTime triggerAt;
+  final int offsetMinutes;
+  final List<String> channels;
+  final String status;
+}
+
 class TaskItem {
   const TaskItem({
     required this.id,
@@ -37,6 +53,7 @@ class TaskItem {
     required this.progressPercent,
     required this.dependsOnTaskId,
     required this.isBlocked,
+    required this.nextReminders,
   });
 
   final int id;
@@ -51,6 +68,7 @@ class TaskItem {
   final int progressPercent;
   final int? dependsOnTaskId;
   final bool isBlocked;
+  final List<TaskReminderPreview> nextReminders;
 
   double get progress {
     if (checklist.isEmpty) {
@@ -213,6 +231,24 @@ class TaskBoardController extends ChangeNotifier {
         )
         .toList();
 
+    final remindersRaw = raw['next_reminders'] as List<dynamic>? ?? const [];
+    final nextReminders = remindersRaw
+        .whereType<Map>()
+        .map(
+          (item) => TaskReminderPreview(
+            id: (item['id'] as num?)?.toInt() ?? 0,
+            triggerAt:
+                DateTime.tryParse(item['trigger_at']?.toString() ?? '') ??
+                DateTime.now().toUtc(),
+            offsetMinutes: (item['offset_minutes'] as num?)?.toInt() ?? 0,
+            channels: (item['channels'] as List<dynamic>? ?? const [])
+                .map((channel) => channel.toString())
+                .toList(),
+            status: item['status']?.toString() ?? 'scheduled',
+          ),
+        )
+        .toList();
+
     return TaskItem(
       id: (raw['id'] as num?)?.toInt() ?? 0,
       title: raw['title']?.toString() ?? '',
@@ -230,6 +266,7 @@ class TaskBoardController extends ChangeNotifier {
       progressPercent: (raw['progress_percent'] as num?)?.toInt() ?? 0,
       dependsOnTaskId: (raw['depends_on_task_id'] as num?)?.toInt(),
       isBlocked: raw['is_blocked'] == true,
+      nextReminders: nextReminders,
     );
   }
 

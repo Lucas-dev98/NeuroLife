@@ -240,6 +240,36 @@ class _TaskCard extends StatelessWidget {
                             color: Color(0xFF6B7280),
                           ),
                         ),
+                      if (task.nextReminders.isNotEmpty) ...[
+                        const SizedBox(height: 6),
+                        Wrap(
+                          spacing: 6,
+                          runSpacing: 6,
+                          children: task.nextReminders
+                              .take(3)
+                              .map(
+                                (reminder) => Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 8,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: const Color(0x120E5A8A),
+                                    borderRadius: BorderRadius.circular(999),
+                                  ),
+                                  child: Text(
+                                    'Lembrete ${_formatReminderTime(reminder.triggerAt)}',
+                                    style: const TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w600,
+                                      color: Color(0xFF0E5A8A),
+                                    ),
+                                  ),
+                                ),
+                              )
+                              .toList(),
+                        ),
+                      ],
                     ],
                   ),
                 ),
@@ -347,6 +377,10 @@ class _TaskCard extends StatelessWidget {
     final hour = value.hour.toString().padLeft(2, '0');
     final minute = value.minute.toString().padLeft(2, '0');
     return '$day/$month $hour:$minute';
+  }
+
+  String _formatReminderTime(DateTime value) {
+    return _formatDate(value.toLocal());
   }
 }
 

@@ -18,12 +18,15 @@ type outboxRow struct {
 	ID        int64
 	UserID    int64
 	EventID   int64
+	TaskID    int64
 	EventType string
 	Payload   []byte
 }
 
-type eventPayload struct {
+type reminderPayload struct {
 	ID                     int64  `json:"id"`
+	EventID                int64  `json:"event_id"`
+	TaskID                 int64  `json:"task_id"`
 	UserID                 int64  `json:"user_id"`
 	Title                  string `json:"title"`
 	Description            string `json:"description"`
@@ -44,6 +47,7 @@ type reminderTriggeredMessage struct {
 	EventType      string   `json:"event_type"`
 	UserID         int64    `json:"user_id"`
 	EventID        int64    `json:"event_id"`
+	TaskID         int64    `json:"task_id"`
 	Title          string   `json:"title"`
 	Description    string   `json:"description,omitempty"`
 	Timezone       string   `json:"timezone"`
@@ -190,7 +194,7 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, pub *publisher, batchSi
 	defer tx.Rollback(ctxBatch)
 
 	rows, err := tx.Query(ctxBatch, `
-		SELECT id, user_id, COALESCE(event_id, 0), event_type, payload
+		SELECT id, user_id, COALESCE(event_id, 0), COALESCE(task_id, 0), event_type, payload
 		FROM reminder_outbox
 		WHERE status = 'pending'
 		ORDER BY id ASC
@@ -205,7 +209,7 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, pub *publisher, batchSi
 	items := make([]outboxRow, 0)
 	for rows.Next() {
 		var r outboxRow
-		if err := rows.Scan(&r.ID, &r.UserID, &r.EventID, &r.EventType, &r.Payload); err != nil {
+		if err := rows.Scan(&r.ID, &r.UserID, &r.EventID, &r.TaskID, &r.EventType, &r.Payload); err != nil {
 			return err
 		}
 		items = append(items, r)
@@ -260,14 +264,9 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, pub *publisher, batchSi
 }
 
 func buildReminderMessages(row outboxRow) ([]reminderTriggeredMessage, error) {
-	var event eventPayload
-	if err := json.Unmarshal(row.Payload, &event); err != nil {
+	var payload reminderPayload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
 		return nil, err
-	}
-
-	startAt, err := time.Parse(time.RFC3339, event.StartAt)
-	if err != nil {
-		return nil, fmt.Errorf("invalid start_at: %w", err)
 	}
 
 	channels := []string{"push", "email", "whatsapp"}
@@ -275,11 +274,20 @@ func buildReminderMessages(row outboxRow) ([]reminderTriggeredMessage, error) {
 	messages := make([]reminderTriggeredMessage, 0)
 
 	action := "upsert"
-	if row.EventType == "event.deleted" {
+	if strings.HasSuffix(row.EventType, ".deleted") {
 		action = "delete"
 	}
 
-	offsets := event.ReminderOffsetsMinutes
+	eventID := payload.EventID
+	if eventID == 0 {
+		eventID = row.EventID
+	}
+	taskID := payload.TaskID
+	if taskID == 0 {
+		taskID = row.TaskID
+	}
+
+	offsets := payload.ReminderOffsetsMinutes
 	if len(offsets) == 0 {
 		offsets = []int{60}
 	}
@@ -294,19 +302,25 @@ func buildReminderMessages(row outboxRow) ([]reminderTriggeredMessage, error) {
 			OutboxID:       row.ID,
 			EventType:      row.EventType,
 			UserID:         row.UserID,
-			EventID:        event.ID,
-			Title:          event.Title,
-			Description:    event.Description,
-			Timezone:       defaultTZ(event.Timezone),
-			StartAt:        event.StartAt,
-			EndAt:          event.EndAt,
-			IsAllDay:       event.IsAllDay,
+			EventID:        eventID,
+			TaskID:         taskID,
+			Title:          payload.Title,
+			Description:    payload.Description,
+			Timezone:       defaultTZ(payload.Timezone),
+			StartAt:        payload.StartAt,
+			EndAt:          payload.EndAt,
+			IsAllDay:       payload.IsAllDay,
 			OffsetMinutes:  0,
 			TriggerAt:      producedAt.Format(time.RFC3339),
 			TargetChannels: channels,
 			CorrelationID:  fmt.Sprintf("outbox-%d-delete", row.ID),
 		})
 		return messages, nil
+	}
+
+	startAt, err := time.Parse(time.RFC3339, payload.StartAt)
+	if err != nil {
+		return nil, fmt.Errorf("invalid start_at: %w", err)
 	}
 
 	for _, offset := range offsets {
@@ -320,13 +334,14 @@ func buildReminderMessages(row outboxRow) ([]reminderTriggeredMessage, error) {
 			OutboxID:       row.ID,
 			EventType:      row.EventType,
 			UserID:         row.UserID,
-			EventID:        event.ID,
-			Title:          event.Title,
-			Description:    event.Description,
-			Timezone:       defaultTZ(event.Timezone),
-			StartAt:        event.StartAt,
-			EndAt:          event.EndAt,
-			IsAllDay:       event.IsAllDay,
+			EventID:        eventID,
+			TaskID:         taskID,
+			Title:          payload.Title,
+			Description:    payload.Description,
+			Timezone:       defaultTZ(payload.Timezone),
+			StartAt:        payload.StartAt,
+			EndAt:          payload.EndAt,
+			IsAllDay:       payload.IsAllDay,
 			OffsetMinutes:  offset,
 			TriggerAt:      triggerAt.Format(time.RFC3339),
 			TargetChannels: channels,

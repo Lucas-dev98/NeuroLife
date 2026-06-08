@@ -24,6 +24,7 @@ type scheduleRow struct {
 	CorrelationID  string
 	UserID         int64
 	EventID        int64
+	TaskID         int64
 	UserEmail      sql.NullString
 	Title          string
 	Description    string
@@ -83,6 +84,7 @@ type deadLetterPayload struct {
 	CorrelationID  string   `json:"correlation_id"`
 	UserID         int64    `json:"user_id"`
 	EventID        int64    `json:"event_id"`
+	TaskID         int64    `json:"task_id"`
 	Title          string   `json:"title"`
 	Description    string   `json:"description"`
 	Timezone       string   `json:"timezone"`
@@ -143,7 +145,8 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			topic TEXT NOT NULL,
 			action TEXT NOT NULL,
 			user_id BIGINT NOT NULL,
-			event_id BIGINT NOT NULL,
+			event_id BIGINT,
+			task_id BIGINT,
 			title TEXT NOT NULL,
 			description TEXT NOT NULL DEFAULT '',
 			timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -164,6 +167,8 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS target_email TEXT`,
 		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS target_push TEXT`,
 		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS target_whatsapp TEXT`,
+		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS task_id BIGINT`,
+		`ALTER TABLE notification_schedule ALTER COLUMN event_id DROP NOT NULL`,
 		`CREATE TABLE IF NOT EXISTS notification_dead_letter (
 			id BIGSERIAL PRIMARY KEY,
 			schedule_id BIGINT NOT NULL,
@@ -173,6 +178,7 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			failed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_dispatch ON notification_schedule (status, trigger_at, next_attempt_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_task_dispatch ON notification_schedule (task_id, status, trigger_at)`,
 	}
 
 	for _, q := range queries {
@@ -194,7 +200,7 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, batchSize int, dispatch
 	defer tx.Rollback(ctxBatch)
 
 	rows, err := tx.Query(ctxBatch, `
-		SELECT s.id, s.correlation_id, s.user_id, s.event_id, u.email,
+		SELECT s.id, s.correlation_id, s.user_id, COALESCE(s.event_id, 0), COALESCE(s.task_id, 0), u.email,
 		       s.title, s.description, s.timezone,
 		       start_at, end_at, trigger_at, offset_minutes, target_channels,
 		       s.target_email, s.target_push, s.target_whatsapp,
@@ -218,7 +224,7 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, batchSize int, dispatch
 	for rows.Next() {
 		var r scheduleRow
 		if err := rows.Scan(
-			&r.ID, &r.CorrelationID, &r.UserID, &r.EventID,
+			&r.ID, &r.CorrelationID, &r.UserID, &r.EventID, &r.TaskID,
 			&r.UserEmail, &r.Title, &r.Description, &r.Timezone,
 			&r.StartAt, &r.EndAt, &r.TriggerAt, &r.OffsetMinutes,
 			&r.TargetChannels, &r.TargetEmail, &r.TargetPush, &r.TargetWhatsApp,
@@ -332,6 +338,7 @@ func (a *pushAdapter) Send(ctx context.Context, row scheduleRow) error {
 			"data": map[string]string{
 				"correlation_id": row.CorrelationID,
 				"event_id":       fmt.Sprintf("%d", row.EventID),
+				"task_id":        fmt.Sprintf("%d", row.TaskID),
 				"trigger_at":     row.TriggerAt.UTC().Format(time.RFC3339),
 			},
 		},
@@ -530,6 +537,7 @@ func markFailure(ctx context.Context, tx pgx.Tx, row scheduleRow, dispatchErr er
 			CorrelationID:  row.CorrelationID,
 			UserID:         row.UserID,
 			EventID:        row.EventID,
+			TaskID:         row.TaskID,
 			Title:          row.Title,
 			Description:    row.Description,
 			Timezone:       row.Timezone,

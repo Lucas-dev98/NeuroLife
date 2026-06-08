@@ -62,6 +62,18 @@ Servicos disponiveis:
 - Resposta da API inclui:
 	- `depends_on_task_id`
 	- `is_blocked` (true quando a tarefa predecessora ainda nao foi concluida).
+	- `next_reminders` (ate 3 proximos lembretes agendados para a tarefa).
+
+### Lembretes por tarefa (Sprint 5 - NLF-501)
+- As tarefas com `due_at` geram contratos de lembrete na `reminder_outbox`.
+- O pipeline `worker -> notifier-consumer -> notifier-dispatcher` agora suporta `task_id` alem de `event_id`.
+- Offsets padrao por prioridade:
+	- `low`: 60 min
+	- `medium`: 1440, 360, 60 min
+	- `high`: 2880, 1440, 360, 60, 15 min
+	- `urgent`: 2880, 1440, 360, 60, 15, 5 min
+- Ao atualizar tarefa com prazo, os lembretes antigos sao cancelados e os novos sao reprocessados.
+- Ao excluir tarefa (ou remover prazo), os lembretes pendentes da tarefa sao cancelados.
 
 ## Mensageria de lembretes
 - Fila RabbitMQ: `reminder.triggered`
@@ -99,6 +111,20 @@ Servicos disponiveis:
 - Execucao:
 ```bash
 ./infra/sql/smoke_gamification.sh
+```
+
+### Smoke test de lembretes por tarefa (HTTP + SQL)
+- Script unico: `infra/sql/smoke_task_reminders.sh`
+- Executa fluxo completo:
+	- cadastro de usuario
+	- criacao de tarefa com prioridade `high`
+	- validacao do outbox para `task_id`
+	- validacao de schedules ativos
+	- update para prioridade `low` (reconciliacao para 1 lembrete ativo)
+	- exclusao da tarefa e cancelamento dos schedules ativos
+- Execucao:
+```bash
+./infra/sql/smoke_task_reminders.sh
 ```
 
 ### Mobile (Flutter) com gamificacao

@@ -377,12 +377,14 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
 			event_id BIGINT REFERENCES events(id) ON DELETE SET NULL,
+			task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
 			event_type TEXT NOT NULL,
 			payload JSONB NOT NULL,
 			status TEXT NOT NULL DEFAULT 'pending',
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			processed_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE reminder_outbox ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_reminder_outbox_status_created ON reminder_outbox (status, created_at)`,
 		`CREATE TABLE IF NOT EXISTS notification_schedule (
 			id BIGSERIAL PRIMARY KEY,
@@ -391,7 +393,8 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			topic TEXT NOT NULL,
 			action TEXT NOT NULL,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-			event_id BIGINT NOT NULL REFERENCES events(id) ON DELETE CASCADE,
+			event_id BIGINT REFERENCES events(id) ON DELETE CASCADE,
+			task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE,
 			title TEXT NOT NULL,
 			description TEXT NOT NULL DEFAULT '',
 			timezone TEXT NOT NULL DEFAULT 'UTC',
@@ -405,7 +408,10 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			canceled_at TIMESTAMPTZ
 		)`,
+		`ALTER TABLE notification_schedule ADD COLUMN IF NOT EXISTS task_id BIGINT REFERENCES tasks(id) ON DELETE CASCADE`,
+		`ALTER TABLE notification_schedule ALTER COLUMN event_id DROP NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_status_trigger ON notification_schedule (status, trigger_at)`,
+		`CREATE INDEX IF NOT EXISTS idx_notification_schedule_task_status_trigger ON notification_schedule (task_id, status, trigger_at)`,
 		`ALTER TABLE events ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ`,
 		`CREATE TABLE IF NOT EXISTS user_gamification (
 			user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
@@ -1369,6 +1375,12 @@ func (a *appContext) handleCreateTask(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate task completion"})
 	}
 
+	if row.DueAt.Valid {
+		if err := a.enqueueTaskReminderContract(ctx, tx, row, "task.created"); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not enqueue task reminder contract"})
+		}
+	}
+
 	if err := tx.Commit(ctx); err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit task creation"})
 	}
@@ -1496,9 +1508,28 @@ func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
 	defer cancel()
 
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var previousDueAt sql.NullTime
+	err = tx.QueryRow(ctx, `
+		SELECT due_at
+		FROM tasks
+		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+	`, taskID, userID).Scan(&previousDueAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load current task"})
+	}
+
 	if dependsOnTaskID != nil {
 		var exists bool
-		err = a.db.QueryRow(ctx, `
+		err = tx.QueryRow(ctx, `
 			SELECT EXISTS(
 				SELECT 1 FROM tasks
 				WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
@@ -1512,7 +1543,8 @@ func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
 		}
 	}
 
-	res, err := a.db.Exec(ctx, `
+	var row taskRow
+	err = tx.QueryRow(ctx, `
 		UPDATE tasks
 		SET title = $1,
 			description = $2,
@@ -1522,12 +1554,31 @@ func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
 			depends_on_task_id = $6,
 			updated_at = NOW()
 		WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL
-	`, title, description, category, priority, dueAt, dependsOnTaskID, taskID, userID)
+		RETURNING id, user_id, title, description, category, priority, due_at, depends_on_task_id, completed_at, created_at, updated_at
+	`, title, description, category, priority, dueAt, dependsOnTaskID, taskID, userID).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.DependsOnTaskID, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update task"})
 	}
-	if res.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+
+	if row.DueAt.Valid {
+		if err := a.enqueueTaskReminderContract(ctx, tx, row, "task.deleted"); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not enqueue task reminder contract"})
+		}
+		if err := a.enqueueTaskReminderContract(ctx, tx, row, "task.updated"); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not enqueue task reminder contract"})
+		}
+	} else if previousDueAt.Valid {
+		if err := a.enqueueTaskReminderContract(ctx, tx, row, "task.deleted"); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not enqueue task reminder contract"})
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit task update"})
 	}
 
 	response, err := a.loadTaskResponse(ctx, userID, taskID)
@@ -1548,16 +1599,33 @@ func (a *appContext) handleDeleteTask(c *fiber.Ctx) error {
 	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
 	defer cancel()
 
-	res, err := a.db.Exec(ctx, `
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var row taskRow
+	err = tx.QueryRow(ctx, `
 		UPDATE tasks
 		SET deleted_at = NOW(), updated_at = NOW()
 		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
-	`, taskID, userID)
+		RETURNING id, user_id, title, description, category, priority, due_at, depends_on_task_id, completed_at, created_at, updated_at
+	`, taskID, userID).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.DependsOnTaskID, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+		}
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not delete task"})
 	}
-	if res.RowsAffected() == 0 {
-		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+
+	if err := a.enqueueTaskReminderContract(ctx, tx, row, "task.deleted"); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not enqueue task reminder contract"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit task deletion"})
 	}
 
 	return c.SendStatus(fiber.StatusNoContent)
@@ -1850,7 +1918,12 @@ func (a *appContext) loadTaskResponse(ctx context.Context, userID int64, taskID 
 		return nil, err
 	}
 
-	return taskRowToResponse(row, checklistRows, isBlocked), nil
+	nextReminders, err := a.loadTaskNextReminders(ctx, row.ID)
+	if err != nil {
+		return nil, err
+	}
+
+	return taskRowToResponse(row, checklistRows, isBlocked, nextReminders), nil
 }
 
 func (a *appContext) isTaskBlocked(ctx context.Context, userID int64, row taskRow) (bool, error) {
@@ -1898,7 +1971,50 @@ func (a *appContext) loadTaskChecklist(ctx context.Context, taskID int64) ([]tas
 	return items, nil
 }
 
-func taskRowToResponse(row taskRow, checklist []taskChecklistRow, isBlocked bool) fiber.Map {
+func (a *appContext) loadTaskNextReminders(ctx context.Context, taskID int64) ([]fiber.Map, error) {
+	rows, err := a.db.Query(ctx, `
+		SELECT id, trigger_at, offset_minutes, target_channels, status
+		FROM notification_schedule
+		WHERE task_id = $1
+		  AND canceled_at IS NULL
+		  AND status IN ('scheduled', 'queued')
+		ORDER BY trigger_at ASC
+		LIMIT 3
+	`, taskID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var (
+			id           int64
+			triggerAt    time.Time
+			offsetMinute int
+			channelsJSON []byte
+			status       string
+		)
+		if err := rows.Scan(&id, &triggerAt, &offsetMinute, &channelsJSON, &status); err != nil {
+			return nil, err
+		}
+
+		channels := []string{}
+		_ = json.Unmarshal(channelsJSON, &channels)
+
+		items = append(items, fiber.Map{
+			"id":             id,
+			"trigger_at":     triggerAt.UTC().Format(time.RFC3339),
+			"offset_minutes": offsetMinute,
+			"channels":       channels,
+			"status":         status,
+		})
+	}
+
+	return items, nil
+}
+
+func taskRowToResponse(row taskRow, checklist []taskChecklistRow, isBlocked bool, nextReminders []fiber.Map) fiber.Map {
 	items := make([]fiber.Map, 0, len(checklist))
 	doneCount := 0
 	for _, item := range checklist {
@@ -1934,6 +2050,7 @@ func taskRowToResponse(row taskRow, checklist []taskChecklistRow, isBlocked bool
 		"completed_at":       nullableTimeRFC3339(row.CompletedAt),
 		"checklist":          items,
 		"progress_percent":   progressPercent,
+		"next_reminders":     nextReminders,
 		"created_at":         row.CreatedAt.UTC().Format(time.RFC3339),
 		"updated_at":         row.UpdatedAt.UTC().Format(time.RFC3339),
 	}
@@ -2324,6 +2441,40 @@ func nullableInt64(v sql.NullInt64) interface{} {
 	return v.Int64
 }
 
+func taskReminderOffsetsByPriority(priority string) []int {
+	switch strings.ToLower(strings.TrimSpace(priority)) {
+	case "low":
+		return []int{60}
+	case "high":
+		return []int{2880, 1440, 360, 60, 15}
+	case "urgent":
+		return []int{2880, 1440, 360, 60, 15, 5}
+	default:
+		return []int{1440, 360, 60}
+	}
+}
+
+func taskRowToReminderPayload(row taskRow, eventType string) fiber.Map {
+	startAt := time.Now().UTC()
+	if row.DueAt.Valid {
+		startAt = row.DueAt.Time.UTC()
+	}
+
+	return fiber.Map{
+		"id":                       row.ID,
+		"task_id":                  row.ID,
+		"user_id":                  row.UserID,
+		"title":                    row.Title,
+		"description":              row.Description,
+		"start_at":                 startAt.Format(time.RFC3339),
+		"end_at":                   startAt.Add(30 * time.Minute).Format(time.RFC3339),
+		"timezone":                 "UTC",
+		"is_all_day":               false,
+		"event_type":               eventType,
+		"reminder_offsets_minutes": taskReminderOffsetsByPriority(row.Priority),
+	}
+}
+
 func (a *appContext) enqueueReminderContract(ctx context.Context, tx pgx.Tx, userID, eventID int64, eventType string, row eventRow) error {
 	payload := eventRowToResponse(row)
 	payload["event_type"] = eventType
@@ -2333,9 +2484,26 @@ func (a *appContext) enqueueReminderContract(ctx context.Context, tx pgx.Tx, use
 	}
 
 	_, err = tx.Exec(ctx, `
-		INSERT INTO reminder_outbox (user_id, event_id, event_type, payload)
-		VALUES ($1, $2, $3, $4::jsonb)
+		INSERT INTO reminder_outbox (user_id, event_id, task_id, event_type, payload)
+		VALUES ($1, $2, NULL, $3, $4::jsonb)
 	`, userID, eventID, eventType, string(payloadJSON))
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *appContext) enqueueTaskReminderContract(ctx context.Context, tx pgx.Tx, row taskRow, eventType string) error {
+	payload := taskRowToReminderPayload(row, eventType)
+	payloadJSON, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	_, err = tx.Exec(ctx, `
+		INSERT INTO reminder_outbox (user_id, event_id, task_id, event_type, payload)
+		VALUES ($1, NULL, $2, $3, $4::jsonb)
+	`, row.UserID, row.ID, eventType, string(payloadJSON))
 	if err != nil {
 		return err
 	}

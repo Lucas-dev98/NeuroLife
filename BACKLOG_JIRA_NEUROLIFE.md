@@ -133,6 +133,7 @@ Objetivo: Converter demandas em execucao clara, rastreavel e em etapas pequenas.
 - Prioridade: Highest
 - Story Points: 8
 - Sprint sugerida: 4
+- Status: Done
 - Labels: tasks, mvp
 - Dependencias: NLF-201
 - Criterios de aceite:
@@ -143,6 +144,7 @@ Objetivo: Converter demandas em execucao clara, rastreavel e em etapas pequenas.
 - Prioridade: Highest
 - Story Points: 5
 - Sprint sugerida: 4
+- Status: Done
 - Labels: tasks, checklist, mvp
 - Dependencias: NLF-401
 - Criterios de aceite:
@@ -153,6 +155,7 @@ Objetivo: Converter demandas em execucao clara, rastreavel e em etapas pequenas.
 - Prioridade: Medium
 - Story Points: 3
 - Sprint sugerida: 4
+- Status: Done
 - Labels: tasks
 - Dependencias: NLF-401
 - Criterios de aceite:
@@ -168,6 +171,7 @@ Objetivo: Minimizar esquecimentos com lembretes multi-canal e escalonamento.
 - Prioridade: Highest
 - Story Points: 8
 - Sprint sugerida: 5
+- Status: Done
 - Labels: notifications, mvp
 - Dependencias: NLF-301, NLF-401
 - Criterios de aceite:
@@ -178,6 +182,7 @@ Objetivo: Minimizar esquecimentos com lembretes multi-canal e escalonamento.
 - Prioridade: Highest
 - Story Points: 5
 - Sprint sugerida: 5
+- Status: Next
 - Labels: notifications, mobile, mvp
 - Dependencias: NLF-501
 - Criterios de aceite:
