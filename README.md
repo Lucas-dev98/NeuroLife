@@ -45,8 +45,23 @@ Servicos disponiveis:
 - `PUT /api/v1/events/:id`: atualiza evento.
 - `DELETE /api/v1/events/:id`: exclui evento (soft delete).
 - `POST /api/v1/events/:id/complete`: conclui evento e aplica XP/streak.
+- `POST /api/v1/tasks`: cria tarefa com checklist inicial opcional.
+- `GET /api/v1/tasks`: lista tarefas do usuario (paginacao por `page` e `limit`).
+- `GET /api/v1/tasks/:id`: detalhe da tarefa.
+- `PUT /api/v1/tasks/:id`: atualiza tarefa.
+- `DELETE /api/v1/tasks/:id`: exclui tarefa (soft delete).
+- `POST /api/v1/tasks/:id/checklist`: adiciona item de checklist.
+- `PATCH /api/v1/tasks/:id/checklist/:itemId`: atualiza status de item de checklist.
+- `DELETE /api/v1/tasks/:id/checklist/:itemId`: remove item de checklist.
 - `GET /api/v1/gamification/summary`: resumo de XP, nivel e streak.
 - `GET /api/v1/gamification/achievements`: lista de conquistas desbloqueadas.
+
+### Dependencias entre tarefas (Sprint 4 - NLF-403)
+- Campo opcional em criacao/atualizacao de tarefa: `depends_on_task_id`.
+- Regra: o `depends_on_task_id` deve apontar para outra tarefa valida do mesmo usuario.
+- Resposta da API inclui:
+	- `depends_on_task_id`
+	- `is_blocked` (true quando a tarefa predecessora ainda nao foi concluida).
 
 ## Mensageria de lembretes
 - Fila RabbitMQ: `reminder.triggered`

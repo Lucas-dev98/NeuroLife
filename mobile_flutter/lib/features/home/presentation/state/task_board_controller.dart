@@ -35,6 +35,8 @@ class TaskItem {
     required this.createdAt,
     required this.updatedAt,
     required this.progressPercent,
+    required this.dependsOnTaskId,
+    required this.isBlocked,
   });
 
   final int id;
@@ -47,6 +49,8 @@ class TaskItem {
   final DateTime createdAt;
   final DateTime updatedAt;
   final int progressPercent;
+  final int? dependsOnTaskId;
+  final bool isBlocked;
 
   double get progress {
     if (checklist.isEmpty) {
@@ -67,6 +71,7 @@ class TaskDraft {
     required this.priority,
     required this.dueAt,
     required this.checklistTitles,
+    required this.dependsOnTaskId,
   });
 
   final String title;
@@ -75,6 +80,7 @@ class TaskDraft {
   final String priority;
   final DateTime? dueAt;
   final List<String> checklistTitles;
+  final int? dependsOnTaskId;
 }
 
 class TaskBoardController extends ChangeNotifier {
@@ -222,6 +228,8 @@ class TaskBoardController extends ChangeNotifier {
           DateTime.tryParse(raw['updated_at']?.toString() ?? '') ??
           DateTime.now().toUtc(),
       progressPercent: (raw['progress_percent'] as num?)?.toInt() ?? 0,
+      dependsOnTaskId: (raw['depends_on_task_id'] as num?)?.toInt(),
+      isBlocked: raw['is_blocked'] == true,
     );
   }
 
@@ -233,6 +241,7 @@ class TaskBoardController extends ChangeNotifier {
       'priority': draft.priority,
       'due_at': draft.dueAt?.toUtc().toIso8601String(),
       'checklist_titles': draft.checklistTitles,
+      'depends_on_task_id': draft.dependsOnTaskId,
     };
   }
 

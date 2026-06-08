@@ -70,9 +70,11 @@ class _TasksPageState extends State<TasksPage> {
     BuildContext context, {
     TaskItem? existingTask,
   }) async {
+    final currentTasks = widget.controller.tasks;
     final draft = await showDialog<TaskDraft>(
       context: context,
-      builder: (dialogContext) => _TaskDialog(existingTask: existingTask),
+      builder: (dialogContext) =>
+          _TaskDialog(existingTask: existingTask, allTasks: currentTasks),
     );
 
     if (draft == null) {
@@ -196,15 +198,48 @@ class _TaskCard extends StatelessWidget {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Text(
-                        task.title,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.w700,
-                          fontSize: 16,
-                        ),
+                      Row(
+                        children: [
+                          Expanded(
+                            child: Text(
+                              task.title,
+                              style: const TextStyle(
+                                fontWeight: FontWeight.w700,
+                                fontSize: 16,
+                              ),
+                            ),
+                          ),
+                          if (task.isBlocked)
+                            Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: const Color(0x1AE67E22),
+                                borderRadius: BorderRadius.circular(999),
+                              ),
+                              child: const Text(
+                                'Bloqueada',
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  fontWeight: FontWeight.w700,
+                                  color: Color(0xFFE67E22),
+                                ),
+                              ),
+                            ),
+                        ],
                       ),
                       const SizedBox(height: 4),
                       Text(_buildMeta(task)),
+                      if (task.dependsOnTaskId != null)
+                        Text(
+                          'Depende da tarefa #${task.dependsOnTaskId}',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Color(0xFF6B7280),
+                          ),
+                        ),
                     ],
                   ),
                 ),
@@ -239,24 +274,46 @@ class _TaskCard extends StatelessWidget {
             const SizedBox(height: 12),
             if (task.checklist.isEmpty)
               TextButton.icon(
-                onPressed: onAddChecklistItem,
+                onPressed: task.isBlocked ? null : onAddChecklistItem,
                 icon: const Icon(Icons.playlist_add_rounded),
                 label: const Text('Adicionar checklist'),
               )
             else
               Column(
                 children: [
+                  if (task.isBlocked)
+                    Container(
+                      width: double.infinity,
+                      margin: const EdgeInsets.only(bottom: 8),
+                      padding: const EdgeInsets.all(10),
+                      decoration: BoxDecoration(
+                        color: const Color(0x1AE67E22),
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                      child: const Text(
+                        'Finalize a tarefa predecessora para desbloquear este checklist.',
+                        style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          color: Color(0xFF8A4B12),
+                        ),
+                      ),
+                    ),
                   for (final item in task.checklist)
                     Material(
                       color: Colors.transparent,
                       child: CheckboxListTile(
                         contentPadding: EdgeInsets.zero,
                         value: item.isDone,
-                        onChanged: (_) => onToggleChecklistItem(item.id),
+                        onChanged: task.isBlocked
+                            ? null
+                            : (_) => onToggleChecklistItem(item.id),
                         title: Text(item.title),
                         secondary: IconButton(
                           tooltip: 'Remover subtarefa',
-                          onPressed: () => onDeleteChecklistItem(item.id),
+                          onPressed: task.isBlocked
+                              ? null
+                              : () => onDeleteChecklistItem(item.id),
                           icon: const Icon(Icons.close_rounded),
                         ),
                       ),
@@ -264,7 +321,7 @@ class _TaskCard extends StatelessWidget {
                   Align(
                     alignment: Alignment.centerLeft,
                     child: TextButton.icon(
-                      onPressed: onAddChecklistItem,
+                      onPressed: task.isBlocked ? null : onAddChecklistItem,
                       icon: const Icon(Icons.playlist_add_rounded),
                       label: const Text('Adicionar item'),
                     ),
@@ -329,9 +386,10 @@ class _EmptyTaskCard extends StatelessWidget {
 }
 
 class _TaskDialog extends StatefulWidget {
-  const _TaskDialog({this.existingTask});
+  const _TaskDialog({this.existingTask, required this.allTasks});
 
   final TaskItem? existingTask;
+  final List<TaskItem> allTasks;
 
   @override
   State<_TaskDialog> createState() => _TaskDialogState();
@@ -345,6 +403,7 @@ class _TaskDialogState extends State<_TaskDialog> {
   late final TextEditingController _checklistController;
   late String _priority;
   DateTime? _dueAt;
+  int? _dependsOnTaskId;
   final List<String> _checklistTitles = [];
 
   @override
@@ -361,6 +420,7 @@ class _TaskDialogState extends State<_TaskDialog> {
     _checklistController = TextEditingController();
     _priority = existing?.priority ?? 'medium';
     _dueAt = existing?.dueAt?.toLocal();
+    _dependsOnTaskId = existing?.dependsOnTaskId;
     if (existing != null) {
       _checklistTitles.addAll(existing.checklist.map((item) => item.title));
     }
@@ -435,6 +495,7 @@ class _TaskDialogState extends State<_TaskDialog> {
         priority: _priority,
         dueAt: _dueAt,
         checklistTitles: _checklistTitles,
+        dependsOnTaskId: _dependsOnTaskId,
       ),
     );
   }
@@ -442,6 +503,9 @@ class _TaskDialogState extends State<_TaskDialog> {
   @override
   Widget build(BuildContext context) {
     final isEditing = widget.existingTask != null;
+    final selectableDependencies = widget.allTasks
+        .where((task) => task.id != widget.existingTask?.id)
+        .toList();
 
     return AlertDialog(
       title: Text(isEditing ? 'Editar tarefa' : 'Nova tarefa'),
@@ -496,6 +560,26 @@ class _TaskDialogState extends State<_TaskDialog> {
                 ),
                 trailing: const Icon(Icons.event_rounded),
                 onTap: _pickDueDate,
+              ),
+              const SizedBox(height: 12),
+              DropdownButtonFormField<int?>(
+                initialValue: _dependsOnTaskId,
+                decoration: const InputDecoration(
+                  labelText: 'Depende de outra tarefa',
+                ),
+                items: [
+                  const DropdownMenuItem<int?>(
+                    value: null,
+                    child: Text('Sem dependencia'),
+                  ),
+                  ...selectableDependencies.map(
+                    (task) => DropdownMenuItem<int?>(
+                      value: task.id,
+                      child: Text('#${task.id} - ${task.title}'),
+                    ),
+                  ),
+                ],
+                onChanged: (value) => setState(() => _dependsOnTaskId = value),
               ),
               const SizedBox(height: 12),
               TextFormField(

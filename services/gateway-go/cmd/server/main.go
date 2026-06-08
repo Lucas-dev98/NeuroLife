@@ -112,12 +112,13 @@ type eventRow struct {
 }
 
 type taskRequest struct {
-	Title          string   `json:"title"`
-	Description    string   `json:"description"`
-	Category       string   `json:"category"`
-	Priority       string   `json:"priority"`
-	DueAt          string   `json:"due_at"`
-	ChecklistItems []string `json:"checklist_titles"`
+	Title           string   `json:"title"`
+	Description     string   `json:"description"`
+	Category        string   `json:"category"`
+	Priority        string   `json:"priority"`
+	DueAt           string   `json:"due_at"`
+	ChecklistItems  []string `json:"checklist_titles"`
+	DependsOnTaskID *int64   `json:"depends_on_task_id"`
 }
 
 type taskChecklistCreateRequest struct {
@@ -129,16 +130,17 @@ type taskChecklistUpdateRequest struct {
 }
 
 type taskRow struct {
-	ID          int64
-	UserID      int64
-	Title       string
-	Description string
-	Category    string
-	Priority    string
-	DueAt       sql.NullTime
-	CompletedAt sql.NullTime
-	CreatedAt   time.Time
-	UpdatedAt   time.Time
+	ID              int64
+	UserID          int64
+	Title           string
+	Description     string
+	Category        string
+	Priority        string
+	DueAt           sql.NullTime
+	DependsOnTaskID sql.NullInt64
+	CompletedAt     sql.NullTime
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
 }
 
 type taskChecklistRow struct {
@@ -352,12 +354,15 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			category TEXT NOT NULL DEFAULT 'Geral',
 			priority TEXT NOT NULL DEFAULT 'medium',
 			due_at TIMESTAMPTZ,
+			depends_on_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
 			completed_at TIMESTAMPTZ,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 			deleted_at TIMESTAMPTZ
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_tasks_user_priority_due ON tasks (user_id, priority, due_at) WHERE deleted_at IS NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_tasks_user_dependency ON tasks (user_id, depends_on_task_id) WHERE deleted_at IS NULL`,
+		`ALTER TABLE tasks ADD COLUMN IF NOT EXISTS depends_on_task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL`,
 		`CREATE TABLE IF NOT EXISTS task_checklist_items (
 			id BIGSERIAL PRIMARY KEY,
 			task_id BIGINT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -1310,7 +1315,7 @@ func (a *appContext) handleCreateTask(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	title, description, category, priority, dueAt, checklistItems, err := validateTaskRequest(req)
+	title, description, category, priority, dueAt, checklistItems, dependsOnTaskID, err := validateTaskRequest(req)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
 	}
@@ -1324,13 +1329,29 @@ func (a *appContext) handleCreateTask(c *fiber.Ctx) error {
 	}
 	defer tx.Rollback(ctx)
 
+	if dependsOnTaskID != nil {
+		var exists bool
+		err = tx.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM tasks
+				WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+			)
+		`, *dependsOnTaskID, userID).Scan(&exists)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not validate task dependency"})
+		}
+		if !exists {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "depends_on_task_id does not reference a valid task"})
+		}
+	}
+
 	var row taskRow
 	err = tx.QueryRow(ctx, `
-		INSERT INTO tasks (user_id, title, description, category, priority, due_at)
-		VALUES ($1, $2, $3, $4, $5, $6)
-		RETURNING id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
-	`, userID, title, description, category, priority, dueAt).
-		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
+		INSERT INTO tasks (user_id, title, description, category, priority, due_at, depends_on_task_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		RETURNING id, user_id, title, description, category, priority, due_at, depends_on_task_id, completed_at, created_at, updated_at
+	`, userID, title, description, category, priority, dueAt, dependsOnTaskID).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.DependsOnTaskID, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create task"})
 	}
@@ -1383,7 +1404,7 @@ func (a *appContext) handleListTasks(c *fiber.Ctx) error {
 	}
 
 	rows, err := a.db.Query(ctx, `
-		SELECT id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
+		SELECT id, user_id, title, description, category, priority, due_at, depends_on_task_id, completed_at, created_at, updated_at
 		FROM tasks
 		WHERE user_id = $1 AND deleted_at IS NULL
 		ORDER BY
@@ -1405,7 +1426,7 @@ func (a *appContext) handleListTasks(c *fiber.Ctx) error {
 	items := make([]fiber.Map, 0)
 	for rows.Next() {
 		var row taskRow
-		if err := rows.Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.DependsOnTaskID, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
 			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse task row"})
 		}
 		taskResp, err := a.loadTaskResponse(ctx, userID, row.ID)
@@ -1464,13 +1485,32 @@ func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
 	}
 
-	title, description, category, priority, dueAt, _, err := validateTaskRequest(req)
+	title, description, category, priority, dueAt, _, dependsOnTaskID, err := validateTaskRequest(req)
 	if err != nil {
 		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+	if dependsOnTaskID != nil && *dependsOnTaskID == taskID {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "depends_on_task_id cannot reference the same task"})
 	}
 
 	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
 	defer cancel()
+
+	if dependsOnTaskID != nil {
+		var exists bool
+		err = a.db.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM tasks
+				WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+			)
+		`, *dependsOnTaskID, userID).Scan(&exists)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not validate task dependency"})
+		}
+		if !exists {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "depends_on_task_id does not reference a valid task"})
+		}
+	}
 
 	res, err := a.db.Exec(ctx, `
 		UPDATE tasks
@@ -1479,9 +1519,10 @@ func (a *appContext) handleUpdateTask(c *fiber.Ctx) error {
 			category = $3,
 			priority = $4,
 			due_at = $5,
+			depends_on_task_id = $6,
 			updated_at = NOW()
-		WHERE id = $6 AND user_id = $7 AND deleted_at IS NULL
-	`, title, description, category, priority, dueAt, taskID, userID)
+		WHERE id = $7 AND user_id = $8 AND deleted_at IS NULL
+	`, title, description, category, priority, dueAt, dependsOnTaskID, taskID, userID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update task"})
 	}
@@ -1706,10 +1747,10 @@ func (a *appContext) handleDeleteTaskChecklistItem(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
-func validateTaskRequest(req taskRequest) (string, string, string, string, interface{}, []string, error) {
+func validateTaskRequest(req taskRequest) (string, string, string, string, interface{}, []string, *int64, error) {
 	title := strings.TrimSpace(req.Title)
 	if len(title) < 3 {
-		return "", "", "", "", nil, nil, errors.New("title must be at least 3 characters")
+		return "", "", "", "", nil, nil, nil, errors.New("title must be at least 3 characters")
 	}
 
 	description := strings.TrimSpace(req.Description)
@@ -1723,7 +1764,7 @@ func validateTaskRequest(req taskRequest) (string, string, string, string, inter
 		priority = "medium"
 	}
 	if priority != "low" && priority != "medium" && priority != "high" && priority != "urgent" {
-		return "", "", "", "", nil, nil, errors.New("priority must be low, medium, high or urgent")
+		return "", "", "", "", nil, nil, nil, errors.New("priority must be low, medium, high or urgent")
 	}
 
 	var dueAt interface{} = nil
@@ -1731,9 +1772,17 @@ func validateTaskRequest(req taskRequest) (string, string, string, string, inter
 	if dueText != "" {
 		parsed, err := time.Parse(time.RFC3339, dueText)
 		if err != nil {
-			return "", "", "", "", nil, nil, errors.New("due_at must be RFC3339")
+			return "", "", "", "", nil, nil, nil, errors.New("due_at must be RFC3339")
 		}
 		dueAt = parsed.UTC()
+	}
+
+	var dependsOnTaskID *int64
+	if req.DependsOnTaskID != nil {
+		if *req.DependsOnTaskID <= 0 {
+			return "", "", "", "", nil, nil, nil, errors.New("depends_on_task_id must be a positive integer")
+		}
+		dependsOnTaskID = req.DependsOnTaskID
 	}
 
 	items := make([]string, 0, len(req.ChecklistItems))
@@ -1745,7 +1794,7 @@ func validateTaskRequest(req taskRequest) (string, string, string, string, inter
 		items = append(items, trimmed)
 	}
 
-	return title, description, category, priority, dueAt, items, nil
+	return title, description, category, priority, dueAt, items, dependsOnTaskID, nil
 }
 
 func (a *appContext) refreshTaskCompletion(ctx context.Context, tx pgx.Tx, taskID int64) error {
@@ -1779,11 +1828,11 @@ func (a *appContext) refreshTaskCompletion(ctx context.Context, tx pgx.Tx, taskI
 func (a *appContext) loadTaskResponse(ctx context.Context, userID int64, taskID int64) (fiber.Map, error) {
 	var row taskRow
 	err := a.db.QueryRow(ctx, `
-		SELECT id, user_id, title, description, category, priority, due_at, completed_at, created_at, updated_at
+		SELECT id, user_id, title, description, category, priority, due_at, depends_on_task_id, completed_at, created_at, updated_at
 		FROM tasks
 		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
 	`, taskID, userID).
-		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Description, &row.Category, &row.Priority, &row.DueAt, &row.DependsOnTaskID, &row.CompletedAt, &row.CreatedAt, &row.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
 			return nil, errors.New("task not found")
@@ -1796,7 +1845,33 @@ func (a *appContext) loadTaskResponse(ctx context.Context, userID int64, taskID 
 		return nil, err
 	}
 
-	return taskRowToResponse(row, checklistRows), nil
+	isBlocked, err := a.isTaskBlocked(ctx, userID, row)
+	if err != nil {
+		return nil, err
+	}
+
+	return taskRowToResponse(row, checklistRows, isBlocked), nil
+}
+
+func (a *appContext) isTaskBlocked(ctx context.Context, userID int64, row taskRow) (bool, error) {
+	if !row.DependsOnTaskID.Valid {
+		return false, nil
+	}
+
+	var predecessorCompletedAt sql.NullTime
+	err := a.db.QueryRow(ctx, `
+		SELECT completed_at
+		FROM tasks
+		WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+	`, row.DependsOnTaskID.Int64, userID).Scan(&predecessorCompletedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return false, nil
+		}
+		return false, err
+	}
+
+	return !predecessorCompletedAt.Valid, nil
 }
 
 func (a *appContext) loadTaskChecklist(ctx context.Context, taskID int64) ([]taskChecklistRow, error) {
@@ -1823,7 +1898,7 @@ func (a *appContext) loadTaskChecklist(ctx context.Context, taskID int64) ([]tas
 	return items, nil
 }
 
-func taskRowToResponse(row taskRow, checklist []taskChecklistRow) fiber.Map {
+func taskRowToResponse(row taskRow, checklist []taskChecklistRow, isBlocked bool) fiber.Map {
 	items := make([]fiber.Map, 0, len(checklist))
 	doneCount := 0
 	for _, item := range checklist {
@@ -1847,18 +1922,20 @@ func taskRowToResponse(row taskRow, checklist []taskChecklistRow) fiber.Map {
 	}
 
 	return fiber.Map{
-		"id":               row.ID,
-		"user_id":          row.UserID,
-		"title":            row.Title,
-		"description":      row.Description,
-		"category":         row.Category,
-		"priority":         row.Priority,
-		"due_at":           nullableTimeRFC3339(row.DueAt),
-		"completed_at":     nullableTimeRFC3339(row.CompletedAt),
-		"checklist":        items,
-		"progress_percent": progressPercent,
-		"created_at":       row.CreatedAt.UTC().Format(time.RFC3339),
-		"updated_at":       row.UpdatedAt.UTC().Format(time.RFC3339),
+		"id":                 row.ID,
+		"user_id":            row.UserID,
+		"title":              row.Title,
+		"description":        row.Description,
+		"category":           row.Category,
+		"priority":           row.Priority,
+		"due_at":             nullableTimeRFC3339(row.DueAt),
+		"depends_on_task_id": nullableInt64(row.DependsOnTaskID),
+		"is_blocked":         isBlocked,
+		"completed_at":       nullableTimeRFC3339(row.CompletedAt),
+		"checklist":          items,
+		"progress_percent":   progressPercent,
+		"created_at":         row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":         row.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 }
 
@@ -2238,6 +2315,13 @@ func nullableTimeRFC3339(v sql.NullTime) interface{} {
 		return nil
 	}
 	return v.Time.UTC().Format(time.RFC3339)
+}
+
+func nullableInt64(v sql.NullInt64) interface{} {
+	if !v.Valid {
+		return nil
+	}
+	return v.Int64
 }
 
 func (a *appContext) enqueueReminderContract(ctx context.Context, tx pgx.Tx, userID, eventID int64, eventType string, row eventRow) error {

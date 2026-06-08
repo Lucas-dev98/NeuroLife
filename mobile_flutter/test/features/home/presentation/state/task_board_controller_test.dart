@@ -25,6 +25,8 @@ void main() {
                       'category': 'Rotina',
                       'priority': 'high',
                       'due_at': '2026-06-08T10:00:00Z',
+                      'depends_on_task_id': null,
+                      'is_blocked': false,
                       'completed_at': null,
                       'progress_percent': 50,
                       'checklist': [
@@ -60,6 +62,8 @@ void main() {
       expect(controller.tasks.first.title, 'Planejar semana');
       expect(controller.tasks.first.checklist, hasLength(2));
       expect(controller.tasks.first.progress, closeTo(0.5, 0.01));
+      expect(controller.tasks.first.dependsOnTaskId, isNull);
+      expect(controller.tasks.first.isBlocked, isFalse);
     });
 
     test('creates task and reloads list', () async {
@@ -75,6 +79,7 @@ void main() {
               final body = jsonDecode(request.body) as Map<String, dynamic>;
               expect(body['title'], 'Nova tarefa');
               expect(body['checklist_titles'], ['A', 'B']);
+              expect(body['depends_on_task_id'], 11);
               return http.Response('{}', 201);
             }
             if (request.method == 'GET' &&
@@ -90,6 +95,8 @@ void main() {
                       'category': 'Geral',
                       'priority': 'medium',
                       'due_at': null,
+                      'depends_on_task_id': null,
+                      'is_blocked': false,
                       'completed_at': null,
                       'progress_percent': 0,
                       'checklist': [],
@@ -115,6 +122,7 @@ void main() {
           priority: 'medium',
           dueAt: null,
           checklistTitles: ['A', 'B'],
+          dependsOnTaskId: 11,
         ),
       );
 
@@ -142,6 +150,8 @@ void main() {
                       'category': 'Rotina',
                       'priority': 'high',
                       'due_at': null,
+                      'depends_on_task_id': 9,
+                      'is_blocked': true,
                       'completed_at': null,
                       'progress_percent': 50,
                       'checklist': [
