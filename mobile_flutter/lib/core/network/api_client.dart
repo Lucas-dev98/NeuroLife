@@ -100,12 +100,24 @@ class ApiClient {
       }
     }
 
-    var response = await send();
+    Future<http.Response> safeSend() async {
+      try {
+        return await send();
+      } on ApiException {
+        rethrow;
+      } on Exception {
+        throw ApiException(
+          'Nao foi possivel conectar ao backend em ${AppConfig.apiBaseUrl}. Verifique se a API esta em execucao e tente novamente.',
+        );
+      }
+    }
+
+    var response = await safeSend();
     if (requiresAuth &&
         response.statusCode == 401 &&
         refreshAccessToken != null) {
       await refreshAccessToken!.call();
-      response = await send();
+      response = await safeSend();
     }
     return response;
   }
