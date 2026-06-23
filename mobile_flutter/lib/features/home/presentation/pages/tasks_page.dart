@@ -38,6 +38,12 @@ class _TasksPageState extends State<TasksPage> {
                   icon: const Icon(Icons.add_rounded),
                   label: const Text('Nova'),
                 ),
+                const SizedBox(width: 8),
+                OutlinedButton.icon(
+                  onPressed: () => _openAiHistory(context),
+                  icon: const Icon(Icons.history_rounded),
+                  label: const Text('Histórico IA'),
+                ),
               ],
             ),
             const SizedBox(height: 8),
@@ -56,6 +62,7 @@ class _TasksPageState extends State<TasksPage> {
                   onDelete: () => _deleteTask(context, task),
                   onGenerateChecklistAi: () =>
                       _generateChecklistWithAi(context, task),
+                  onViewAiHistory: () => _openAiHistory(context, task: task),
                   onAddChecklistItem: () => _addChecklistItem(context, task),
                   onToggleChecklistItem: (itemId) =>
                       widget.controller.toggleChecklistItem(task.id, itemId),
@@ -176,6 +183,16 @@ class _TasksPageState extends State<TasksPage> {
       const SnackBar(content: Text('Checklist gerado com IA com sucesso.')),
     );
   }
+
+  Future<void> _openAiHistory(BuildContext context, {TaskItem? task}) async {
+    await showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (sheetContext) =>
+          _AiHistorySheet(controller: widget.controller, task: task),
+    );
+  }
 }
 
 class _TaskCard extends StatelessWidget {
@@ -184,6 +201,7 @@ class _TaskCard extends StatelessWidget {
     required this.onEdit,
     required this.onDelete,
     required this.onGenerateChecklistAi,
+    required this.onViewAiHistory,
     required this.onAddChecklistItem,
     required this.onToggleChecklistItem,
     required this.onDeleteChecklistItem,
@@ -193,6 +211,7 @@ class _TaskCard extends StatelessWidget {
   final VoidCallback onEdit;
   final VoidCallback onDelete;
   final VoidCallback onGenerateChecklistAi;
+  final VoidCallback onViewAiHistory;
   final VoidCallback onAddChecklistItem;
   final void Function(int checklistItemId) onToggleChecklistItem;
   final void Function(int checklistItemId) onDeleteChecklistItem;
@@ -311,6 +330,9 @@ class _TaskCard extends StatelessWidget {
                       case 'ai':
                         onGenerateChecklistAi();
                         break;
+                      case 'history':
+                        onViewAiHistory();
+                        break;
                       case 'edit':
                         onEdit();
                         break;
@@ -323,6 +345,10 @@ class _TaskCard extends StatelessWidget {
                     PopupMenuItem(
                       value: 'ai',
                       child: Text('Gerar checklist IA'),
+                    ),
+                    PopupMenuItem(
+                      value: 'history',
+                      child: Text('Histórico IA'),
                     ),
                     PopupMenuItem(value: 'edit', child: Text('Editar')),
                     PopupMenuItem(value: 'delete', child: Text('Excluir')),
@@ -444,6 +470,232 @@ class _TaskCard extends StatelessWidget {
 
   String _formatReminderTime(DateTime value) {
     return _formatDate(value.toLocal());
+  }
+}
+
+class _AiHistorySheet extends StatefulWidget {
+  const _AiHistorySheet({required this.controller, this.task});
+
+  final TaskBoardController controller;
+  final TaskItem? task;
+
+  @override
+  State<_AiHistorySheet> createState() => _AiHistorySheetState();
+}
+
+class _AiHistorySheetState extends State<_AiHistorySheet> {
+  late Future<TaskAiSuggestionPage> _future;
+
+  @override
+  void initState() {
+    super.initState();
+    _future = _load();
+  }
+
+  Future<TaskAiSuggestionPage> _load() {
+    return widget.controller.loadAiSuggestions(taskId: widget.task?.id);
+  }
+
+  Future<void> _refresh() async {
+    setState(() {
+      _future = _load();
+    });
+    await _future;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final bottomPadding = MediaQuery.of(context).padding.bottom + 16;
+
+    return SafeArea(
+      child: Padding(
+        padding: EdgeInsets.fromLTRB(20, 0, 20, bottomPadding),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    widget.task == null
+                        ? 'Historico de IA'
+                        : 'Historico de IA da tarefa',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      fontWeight: FontWeight.w800,
+                    ),
+                  ),
+                ),
+                IconButton(
+                  onPressed: _refresh,
+                  icon: const Icon(Icons.refresh_rounded),
+                ),
+              ],
+            ),
+            if (widget.task != null) ...[
+              const SizedBox(height: 4),
+              Text(
+                widget.task!.title,
+                style: Theme.of(context).textTheme.bodyMedium,
+              ),
+            ],
+            const SizedBox(height: 12),
+            FutureBuilder<TaskAiSuggestionPage>(
+              future: _future,
+              builder: (context, snapshot) {
+                if (snapshot.connectionState == ConnectionState.waiting) {
+                  return const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 40),
+                    child: Center(child: CircularProgressIndicator()),
+                  );
+                }
+
+                if (snapshot.hasError) {
+                  return Padding(
+                    padding: const EdgeInsets.only(bottom: 16),
+                    child: Text(
+                      'Falha ao carregar historico: ${snapshot.error}',
+                      style: const TextStyle(color: Colors.red),
+                    ),
+                  );
+                }
+
+                final page = snapshot.data;
+                final items = page?.items ?? const [];
+
+                if (items.isEmpty) {
+                  return const Padding(
+                    padding: EdgeInsets.symmetric(vertical: 24),
+                    child: Text('Nenhuma sugestao de IA encontrada.'),
+                  );
+                }
+
+                return ConstrainedBox(
+                  constraints: BoxConstraints(
+                    maxHeight: MediaQuery.of(context).size.height * 0.65,
+                  ),
+                  child: ListView.separated(
+                    shrinkWrap: true,
+                    itemCount: items.length,
+                    separatorBuilder: (_, __) => const SizedBox(height: 12),
+                    itemBuilder: (context, index) {
+                      final item = items[index];
+                      return Container(
+                        padding: const EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: Colors.white,
+                          borderRadius: BorderRadius.circular(16),
+                          border: Border.all(color: const Color(0xFFE5E7EB)),
+                        ),
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Expanded(
+                                  child: Text(
+                                    item.titleInput,
+                                    style: const TextStyle(
+                                      fontWeight: FontWeight.w700,
+                                      fontSize: 15,
+                                    ),
+                                  ),
+                                ),
+                                if (item.applied)
+                                  _Tag(
+                                    label: 'Aplicada',
+                                    color: const Color(0x1A0E5A8A),
+                                    textColor: const Color(0xFF0E5A8A),
+                                  )
+                                else
+                                  _Tag(
+                                    label: 'Preview',
+                                    color: const Color(0x1A6B7280),
+                                    textColor: const Color(0xFF6B7280),
+                                  ),
+                              ],
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              item.context.isEmpty
+                                  ? 'Sem contexto adicional'
+                                  : 'Contexto: ${item.context}',
+                              style: const TextStyle(fontSize: 12),
+                            ),
+                            const SizedBox(height: 6),
+                            Text(
+                              '${item.subtasks.length} subtarefas • ${_formatDate(item.createdAt)}',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF6B7280),
+                              ),
+                            ),
+                            const SizedBox(height: 10),
+                            ...item.subtasks.map(
+                              (subtask) => Padding(
+                                padding: const EdgeInsets.only(bottom: 4),
+                                child: Row(
+                                  crossAxisAlignment: CrossAxisAlignment.start,
+                                  children: [
+                                    const Text('• '),
+                                    Expanded(child: Text(subtask)),
+                                  ],
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      );
+                    },
+                  ),
+                );
+              },
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _formatDate(DateTime value) {
+    final local = value.toLocal();
+    final day = local.day.toString().padLeft(2, '0');
+    final month = local.month.toString().padLeft(2, '0');
+    final hour = local.hour.toString().padLeft(2, '0');
+    final minute = local.minute.toString().padLeft(2, '0');
+    return '$day/$month $hour:$minute';
+  }
+}
+
+class _Tag extends StatelessWidget {
+  const _Tag({
+    required this.label,
+    required this.color,
+    required this.textColor,
+  });
+
+  final String label;
+  final Color color;
+  final Color textColor;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      margin: const EdgeInsets.only(left: 8),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color,
+        borderRadius: BorderRadius.circular(999),
+      ),
+      child: Text(
+        label,
+        style: TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          color: textColor,
+        ),
+      ),
+    );
   }
 }
 

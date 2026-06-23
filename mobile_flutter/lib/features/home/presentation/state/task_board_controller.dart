@@ -39,6 +39,50 @@ class TaskReminderPreview {
   final String status;
 }
 
+class TaskAiSuggestion {
+  const TaskAiSuggestion({
+    required this.id,
+    required this.userId,
+    required this.taskId,
+    required this.titleInput,
+    required this.context,
+    required this.source,
+    required this.subtasks,
+    required this.applied,
+    required this.replaceExisting,
+    required this.createdAt,
+  });
+
+  final int id;
+  final int userId;
+  final int? taskId;
+  final String titleInput;
+  final String context;
+  final String source;
+  final List<String> subtasks;
+  final bool applied;
+  final bool replaceExisting;
+  final DateTime createdAt;
+}
+
+class TaskAiSuggestionPage {
+  const TaskAiSuggestionPage({
+    required this.items,
+    required this.page,
+    required this.limit,
+    required this.total,
+    required this.totalPages,
+    required this.taskId,
+  });
+
+  final List<TaskAiSuggestion> items;
+  final int page;
+  final int limit;
+  final int total;
+  final int totalPages;
+  final int? taskId;
+}
+
 class TaskItem {
   const TaskItem({
     required this.id,
@@ -209,6 +253,40 @@ class TaskBoardController extends ChangeNotifier {
     await load();
   }
 
+  Future<TaskAiSuggestionPage> loadAiSuggestions({
+    int? taskId,
+    int page = 1,
+    int limit = 20,
+  }) async {
+    final params = <String, String>{
+      'page': page.toString(),
+      'limit': limit.toString(),
+    };
+    if (taskId != null) {
+      params['task_id'] = taskId.toString();
+    }
+
+    final response = await apiClient.get(
+      '/api/v1/tasks/ai-suggestions?${Uri(queryParameters: params).query}',
+      requiresAuth: true,
+    );
+    _requireSuccess(response.statusCode, action: 'carregar historico de IA');
+
+    final data = apiClient.decodeJsonObject(response.body);
+    final itemsRaw = data['items'] as List<dynamic>? ?? const [];
+    final items = itemsRaw.whereType<Map>().map(_mapAiSuggestion).toList();
+    final pagination = data['pagination'] as Map? ?? const {};
+
+    return TaskAiSuggestionPage(
+      items: items,
+      page: (pagination['page'] as num?)?.toInt() ?? page,
+      limit: (pagination['limit'] as num?)?.toInt() ?? limit,
+      total: (pagination['total'] as num?)?.toInt() ?? items.length,
+      totalPages: (pagination['total_pages'] as num?)?.toInt() ?? 1,
+      taskId: (data['task_id'] as num?)?.toInt(),
+    );
+  }
+
   Future<void> applyAiChecklist({
     required int taskId,
     String? title,
@@ -294,6 +372,24 @@ class TaskBoardController extends ChangeNotifier {
       dependsOnTaskId: (raw['depends_on_task_id'] as num?)?.toInt(),
       isBlocked: raw['is_blocked'] == true,
       nextReminders: nextReminders,
+    );
+  }
+
+  TaskAiSuggestion _mapAiSuggestion(Map raw) {
+    final subtasksRaw = raw['subtasks'] as List<dynamic>? ?? const [];
+    return TaskAiSuggestion(
+      id: (raw['id'] as num?)?.toInt() ?? 0,
+      userId: (raw['user_id'] as num?)?.toInt() ?? 0,
+      taskId: (raw['task_id'] as num?)?.toInt(),
+      titleInput: raw['title_input']?.toString() ?? '',
+      context: raw['context']?.toString() ?? '',
+      source: raw['source']?.toString() ?? 'ai-python',
+      subtasks: subtasksRaw.map((subtask) => subtask.toString()).toList(),
+      applied: raw['applied'] == true,
+      replaceExisting: raw['replace_existing'] == true,
+      createdAt:
+          DateTime.tryParse(raw['created_at']?.toString() ?? '') ??
+          DateTime.now().toUtc(),
     );
   }
 
