@@ -178,6 +178,49 @@ type taskChecklistRow struct {
 	UpdatedAt time.Time
 }
 
+type financeAccountRequest struct {
+	Name        string  `json:"name"`
+	Institution string  `json:"institution"`
+	AccountType string  `json:"account_type"`
+	Currency    string  `json:"currency"`
+	Balance     float64 `json:"balance"`
+}
+
+type financeTransactionRequest struct {
+	AccountID   int64   `json:"account_id"`
+	Kind        string  `json:"kind"`
+	Category    string  `json:"category"`
+	Title       string  `json:"title"`
+	Description string  `json:"description"`
+	Amount      float64 `json:"amount"`
+	OccurredAt  string  `json:"occurred_at"`
+}
+
+type financeAccountRow struct {
+	ID          int64
+	UserID      int64
+	Name        string
+	Institution string
+	AccountType string
+	Currency    string
+	Balance     float64
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+type financeTransactionRow struct {
+	ID          int64
+	UserID      int64
+	AccountID   int64
+	Kind        string
+	Category    string
+	Title       string
+	Description string
+	Amount      float64
+	OccurredAt  time.Time
+	CreatedAt   time.Time
+}
+
 type gamificationSummary struct {
 	XP              int    `json:"xp"`
 	Level           int    `json:"level"`
@@ -261,6 +304,11 @@ func main() {
 	secured.Post("/tasks/:id/checklist", appCtx.handleAddTaskChecklistItem)
 	secured.Patch("/tasks/:id/checklist/:itemId", appCtx.handleUpdateTaskChecklistItem)
 	secured.Delete("/tasks/:id/checklist/:itemId", appCtx.handleDeleteTaskChecklistItem)
+	secured.Post("/finance/accounts", appCtx.handleCreateFinanceAccount)
+	secured.Get("/finance/accounts", appCtx.handleListFinanceAccounts)
+	secured.Post("/finance/transactions", appCtx.handleCreateFinanceTransaction)
+	secured.Get("/finance/transactions", appCtx.handleListFinanceTransactions)
+	secured.Get("/finance/summary", appCtx.handleGetFinanceSummary)
 	secured.Get("/gamification/summary", appCtx.handleGetGamificationSummary)
 	secured.Get("/gamification/achievements", appCtx.handleGetAchievements)
 
@@ -419,6 +467,32 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_ai_suggestions_user_created ON task_ai_suggestions (user_id, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS finance_accounts (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL,
+			institution TEXT NOT NULL DEFAULT '',
+			account_type TEXT NOT NULL DEFAULT 'checking',
+			currency TEXT NOT NULL DEFAULT 'BRL',
+			balance NUMERIC(14,2) NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_accounts_user ON finance_accounts (user_id, created_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS finance_transactions (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			account_id BIGINT NOT NULL REFERENCES finance_accounts(id) ON DELETE CASCADE,
+			kind TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT 'geral',
+			title TEXT NOT NULL,
+			description TEXT NOT NULL DEFAULT '',
+			amount NUMERIC(14,2) NOT NULL,
+			occurred_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_occurred ON finance_transactions (user_id, occurred_at DESC)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_kind ON finance_transactions (user_id, kind, occurred_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS reminder_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2167,6 +2241,316 @@ func (a *appContext) handleListTaskAISuggestions(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
+func (a *appContext) handleCreateFinanceAccount(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	var req financeAccountRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if len(name) < 2 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "name must be at least 2 characters"})
+	}
+
+	institution := strings.TrimSpace(req.Institution)
+	accountType, err := normalizeFinanceAccountType(req.AccountType)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	currency := strings.ToUpper(strings.TrimSpace(req.Currency))
+	if currency == "" {
+		currency = "BRL"
+	}
+	if len(currency) != 3 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "currency must be ISO-4217 format (3 letters)"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	var row financeAccountRow
+	err = a.db.QueryRow(ctx, `
+		INSERT INTO finance_accounts (user_id, name, institution, account_type, currency, balance)
+		VALUES ($1, $2, $3, $4, $5, ROUND($6::numeric, 2))
+		RETURNING id, user_id, name, institution, account_type, currency, balance::float8, created_at, updated_at
+	`, userID, name, institution, accountType, currency, req.Balance).
+		Scan(&row.ID, &row.UserID, &row.Name, &row.Institution, &row.AccountType, &row.Currency, &row.Balance, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create finance account"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(financeAccountRowToResponse(row))
+}
+
+func (a *appContext) handleListFinanceAccounts(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, `
+		SELECT id, user_id, name, institution, account_type, currency, balance::float8, created_at, updated_at
+		FROM finance_accounts
+		WHERE user_id = $1
+		ORDER BY created_at DESC, id DESC
+	`, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list finance accounts"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row financeAccountRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Name, &row.Institution, &row.AccountType, &row.Currency, &row.Balance, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse finance account"})
+		}
+		items = append(items, financeAccountRowToResponse(row))
+	}
+
+	return c.JSON(fiber.Map{"accounts": items})
+}
+
+func (a *appContext) handleCreateFinanceTransaction(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	var req financeTransactionRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	if req.AccountID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "account_id must be a positive integer"})
+	}
+
+	kind, err := normalizeFinanceKind(req.Kind)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if len(title) < 2 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "title must be at least 2 characters"})
+	}
+
+	category := strings.TrimSpace(req.Category)
+	if category == "" {
+		category = "geral"
+	}
+	description := strings.TrimSpace(req.Description)
+
+	amount := req.Amount
+	if amount <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "amount must be greater than zero"})
+	}
+
+	occurredAt := time.Now().UTC()
+	if raw := strings.TrimSpace(req.OccurredAt); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "occurred_at must be RFC3339"})
+		}
+		occurredAt = parsed.UTC()
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var accountExists bool
+	err = tx.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1 FROM finance_accounts
+			WHERE id = $1 AND user_id = $2
+		)
+	`, req.AccountID, userID).Scan(&accountExists)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not validate account"})
+	}
+	if !accountExists {
+		return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "finance account not found"})
+	}
+
+	signedAmount := amount
+	if kind == "expense" {
+		signedAmount = -amount
+	}
+
+	var row financeTransactionRow
+	err = tx.QueryRow(ctx, `
+		INSERT INTO finance_transactions (user_id, account_id, kind, category, title, description, amount, occurred_at)
+		VALUES ($1, $2, $3, $4, $5, $6, ROUND($7::numeric, 2), $8)
+		RETURNING id, user_id, account_id, kind, category, title, description, amount::float8, occurred_at, created_at
+	`, userID, req.AccountID, kind, category, title, description, amount, occurredAt).
+		Scan(&row.ID, &row.UserID, &row.AccountID, &row.Kind, &row.Category, &row.Title, &row.Description, &row.Amount, &row.OccurredAt, &row.CreatedAt)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create finance transaction"})
+	}
+
+	if _, err := tx.Exec(ctx, `
+		UPDATE finance_accounts
+		SET balance = ROUND(balance + $1::numeric, 2), updated_at = NOW()
+		WHERE id = $2 AND user_id = $3
+	`, signedAmount, req.AccountID, userID); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update account balance"})
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit finance transaction"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(financeTransactionRowToResponse(row))
+}
+
+func (a *appContext) handleListFinanceTransactions(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	page := parsePositiveInt(c.Query("page"), 1)
+	limit := parsePositiveInt(c.Query("limit"), 20)
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+
+	kindFilter := ""
+	if raw := strings.TrimSpace(c.Query("kind")); raw != "" {
+		kind, err := normalizeFinanceKind(raw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		kindFilter = kind
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	where := " WHERE user_id = $1 "
+	args := []interface{}{userID}
+	argPos := 2
+	if kindFilter != "" {
+		where += fmt.Sprintf(" AND kind = $%d", argPos)
+		args = append(args, kindFilter)
+		argPos++
+	}
+
+	var total int
+	if err := a.db.QueryRow(ctx, "SELECT COUNT(*) FROM finance_transactions"+where, args...).Scan(&total); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not count finance transactions"})
+	}
+
+	query := `
+		SELECT id, user_id, account_id, kind, category, title, description, amount::float8, occurred_at, created_at
+		FROM finance_transactions
+	` + where + fmt.Sprintf(" ORDER BY occurred_at DESC, id DESC LIMIT $%d OFFSET $%d", argPos, argPos+1)
+	args = append(args, limit, offset)
+
+	rows, err := a.db.Query(ctx, query, args...)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list finance transactions"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row financeTransactionRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.AccountID, &row.Kind, &row.Category, &row.Title, &row.Description, &row.Amount, &row.OccurredAt, &row.CreatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse finance transaction"})
+		}
+		items = append(items, financeTransactionRowToResponse(row))
+	}
+
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+
+	return c.JSON(fiber.Map{
+		"transactions": items,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+	})
+}
+
+func (a *appContext) handleGetFinanceSummary(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	fromStr := strings.TrimSpace(c.Query("from"))
+	toStr := strings.TrimSpace(c.Query("to"))
+
+	where := " WHERE user_id = $1 "
+	args := []interface{}{userID}
+	argPos := 2
+	if fromStr != "" {
+		fromAt, err := time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid from date, use RFC3339"})
+		}
+		where += fmt.Sprintf(" AND occurred_at >= $%d", argPos)
+		args = append(args, fromAt.UTC())
+		argPos++
+	}
+	if toStr != "" {
+		toAt, err := time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid to date, use RFC3339"})
+		}
+		where += fmt.Sprintf(" AND occurred_at <= $%d", argPos)
+		args = append(args, toAt.UTC())
+	}
+
+	var income float64
+	var expense float64
+	var txCount int
+	err := a.db.QueryRow(ctx, `
+		SELECT
+			COALESCE(SUM(CASE WHEN kind = 'income' THEN amount ELSE 0 END), 0)::float8,
+			COALESCE(SUM(CASE WHEN kind = 'expense' THEN amount ELSE 0 END), 0)::float8,
+			COUNT(*)
+		FROM finance_transactions
+	`+where, args...).Scan(&income, &expense, &txCount)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not calculate finance summary"})
+	}
+
+	var accountBalance float64
+	err = a.db.QueryRow(ctx, `
+		SELECT COALESCE(SUM(balance), 0)::float8
+		FROM finance_accounts
+		WHERE user_id = $1
+	`, userID).Scan(&accountBalance)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load account balances"})
+	}
+
+	return c.JSON(fiber.Map{
+		"totals": fiber.Map{
+			"income":            income,
+			"expense":           expense,
+			"net":               income - expense,
+			"transaction_count": txCount,
+			"account_balance":   accountBalance,
+		},
+		"filters": fiber.Map{
+			"from": fromStr,
+			"to":   toStr,
+		},
+	})
+}
+
 func (a *appContext) decomposeTaskViaAI(ctx context.Context, title string, contextText string) (string, []string, int, error) {
 	title = strings.TrimSpace(title)
 	if len(title) < 3 {
@@ -2229,6 +2613,54 @@ func (a *appContext) decomposeTaskViaAI(ctx context.Context, title string, conte
 	}
 
 	return resolvedTitle, cleanSubtasks, fiber.StatusOK, nil
+}
+
+func normalizeFinanceKind(raw string) (string, error) {
+	kind := strings.ToLower(strings.TrimSpace(raw))
+	if kind != "income" && kind != "expense" {
+		return "", errors.New("kind must be income or expense")
+	}
+	return kind, nil
+}
+
+func normalizeFinanceAccountType(raw string) (string, error) {
+	t := strings.ToLower(strings.TrimSpace(raw))
+	if t == "" {
+		return "checking", nil
+	}
+	if t != "checking" && t != "savings" && t != "credit" && t != "wallet" && t != "other" {
+		return "", errors.New("account_type must be checking, savings, credit, wallet or other")
+	}
+	return t, nil
+}
+
+func financeAccountRowToResponse(row financeAccountRow) fiber.Map {
+	return fiber.Map{
+		"id":           row.ID,
+		"user_id":      row.UserID,
+		"name":         row.Name,
+		"institution":  row.Institution,
+		"account_type": row.AccountType,
+		"currency":     row.Currency,
+		"balance":      row.Balance,
+		"created_at":   row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":   row.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func financeTransactionRowToResponse(row financeTransactionRow) fiber.Map {
+	return fiber.Map{
+		"id":          row.ID,
+		"user_id":     row.UserID,
+		"account_id":  row.AccountID,
+		"kind":        row.Kind,
+		"category":    row.Category,
+		"title":       row.Title,
+		"description": row.Description,
+		"amount":      row.Amount,
+		"occurred_at": row.OccurredAt.UTC().Format(time.RFC3339),
+		"created_at":  row.CreatedAt.UTC().Format(time.RFC3339),
+	}
 }
 
 func (a *appContext) recordTaskAISuggestion(
