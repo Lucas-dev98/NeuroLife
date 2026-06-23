@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -9,8 +10,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"sort"
 	"strconv"
@@ -130,6 +133,21 @@ type taskChecklistUpdateRequest struct {
 	IsDone bool `json:"is_done"`
 }
 
+type taskDecomposeRequest struct {
+	Title   string `json:"title"`
+	Context string `json:"context"`
+}
+
+type aiDecomposeRequest struct {
+	Title   string `json:"title"`
+	Context string `json:"context,omitempty"`
+}
+
+type aiDecomposeResponse struct {
+	Title    string   `json:"title"`
+	Subtasks []string `json:"subtasks"`
+}
+
 type taskRow struct {
 	ID              int64
 	UserID          int64
@@ -231,6 +249,7 @@ func main() {
 	secured.Get("/tasks/:id", appCtx.handleGetTask)
 	secured.Put("/tasks/:id", appCtx.handleUpdateTask)
 	secured.Delete("/tasks/:id", appCtx.handleDeleteTask)
+	secured.Post("/tasks/decompose", appCtx.handleDecomposeTask)
 	secured.Post("/tasks/:id/checklist", appCtx.handleAddTaskChecklistItem)
 	secured.Patch("/tasks/:id/checklist/:itemId", appCtx.handleUpdateTaskChecklistItem)
 	secured.Delete("/tasks/:id/checklist/:itemId", appCtx.handleDeleteTaskChecklistItem)
@@ -1819,6 +1838,87 @@ func (a *appContext) handleDeleteTaskChecklistItem(c *fiber.Ctx) error {
 	}
 
 	return c.JSON(response)
+}
+
+func (a *appContext) handleDecomposeTask(c *fiber.Ctx) error {
+	_ = c.Locals("user_id").(int64)
+
+	var req taskDecomposeRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if len(title) < 3 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "title must be at least 3 characters"})
+	}
+
+	contextText := strings.TrimSpace(req.Context)
+
+	payload := aiDecomposeRequest{
+		Title: title,
+	}
+	if contextText != "" {
+		payload.Context = contextText
+	}
+
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not encode request"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 8*time.Second)
+	defer cancel()
+
+	aiURL := strings.TrimRight(envOr("AI_SERVICE_URL", "http://ai-service:"+envOr("AI_SERVICE_PORT", "8000")), "/") + "/v1/decompose-task"
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, aiURL, bytes.NewReader(body))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not prepare ai request"})
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 8 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "ai service unavailable"})
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		if len(msg) == 0 {
+			msg = []byte("unexpected ai service response")
+		}
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{
+			"error":       "ai service error",
+			"status_code": resp.StatusCode,
+			"details":     string(msg),
+		})
+	}
+
+	var aiResp aiDecomposeResponse
+	if err := json.NewDecoder(resp.Body).Decode(&aiResp); err != nil {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "invalid ai response"})
+	}
+
+	cleanSubtasks := make([]string, 0, len(aiResp.Subtasks))
+	for _, item := range aiResp.Subtasks {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		cleanSubtasks = append(cleanSubtasks, trimmed)
+	}
+
+	if len(cleanSubtasks) == 0 {
+		return c.Status(fiber.StatusBadGateway).JSON(fiber.Map{"error": "ai returned no subtasks"})
+	}
+
+	return c.JSON(fiber.Map{
+		"title":    strings.TrimSpace(aiResp.Title),
+		"subtasks": cleanSubtasks,
+		"source":   "ai-python",
+	})
 }
 
 func validateTaskRequest(req taskRequest) (string, string, string, string, interface{}, []string, *int64, error) {
