@@ -252,6 +252,7 @@ func main() {
 	secured.Post("/events/:id/complete", appCtx.handleCompleteEvent)
 	secured.Post("/tasks", appCtx.handleCreateTask)
 	secured.Get("/tasks", appCtx.handleListTasks)
+	secured.Get("/tasks/ai-suggestions", appCtx.handleListTaskAISuggestions)
 	secured.Get("/tasks/:id", appCtx.handleGetTask)
 	secured.Put("/tasks/:id", appCtx.handleUpdateTask)
 	secured.Delete("/tasks/:id", appCtx.handleDeleteTask)
@@ -2024,6 +2025,143 @@ func (a *appContext) handleDecomposeApplyTask(c *fiber.Ctx) error {
 		"replace_existing": req.ReplaceExisting,
 		"source":           "ai-python",
 		"suggestion_id":    suggestionID,
+	}
+
+	return c.JSON(response)
+}
+
+func (a *appContext) handleListTaskAISuggestions(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	page := parsePositiveInt(c.Query("page"), 1)
+	limit := parsePositiveInt(c.Query("limit"), 20)
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	taskIDFilter := int64(0)
+	hasTaskIDFilter := false
+	if raw := strings.TrimSpace(c.Query("task_id")); raw != "" {
+		parsedTaskID, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || parsedTaskID <= 0 {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "task_id must be a positive integer"})
+		}
+
+		var exists bool
+		err = a.db.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM tasks
+				WHERE id = $1 AND user_id = $2 AND deleted_at IS NULL
+			)
+		`, parsedTaskID, userID).Scan(&exists)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not validate task_id"})
+		}
+		if !exists {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "task not found"})
+		}
+
+		hasTaskIDFilter = true
+		taskIDFilter = parsedTaskID
+	}
+
+	countQuery := `
+		SELECT COUNT(*)
+		FROM task_ai_suggestions
+		WHERE user_id = $1
+	`
+	countArgs := []interface{}{userID}
+	if hasTaskIDFilter {
+		countQuery += ` AND task_id = $2`
+		countArgs = append(countArgs, taskIDFilter)
+	}
+
+	var total int
+	if err := a.db.QueryRow(ctx, countQuery, countArgs...).Scan(&total); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not count ai suggestions"})
+	}
+
+	listQuery := `
+		SELECT id, user_id, task_id, title_input, context, source, subtasks, applied, replace_existing, created_at
+		FROM task_ai_suggestions
+		WHERE user_id = $1
+	`
+	listArgs := []interface{}{userID}
+	argPos := 2
+	if hasTaskIDFilter {
+		listQuery += fmt.Sprintf(" AND task_id = $%d", argPos)
+		listArgs = append(listArgs, taskIDFilter)
+		argPos++
+	}
+	listQuery += fmt.Sprintf(" ORDER BY created_at DESC, id DESC LIMIT $%d OFFSET $%d", argPos, argPos+1)
+	listArgs = append(listArgs, limit, offset)
+
+	rows, err := a.db.Query(ctx, listQuery, listArgs...)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list ai suggestions"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var (
+			id              int64
+			rowUserID       int64
+			taskID          sql.NullInt64
+			titleInput      string
+			contextText     string
+			source          string
+			subtasksJSON    []byte
+			applied         bool
+			replaceExisting bool
+			createdAt       time.Time
+		)
+
+		if err := rows.Scan(&id, &rowUserID, &taskID, &titleInput, &contextText, &source, &subtasksJSON, &applied, &replaceExisting, &createdAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse ai suggestion"})
+		}
+
+		subtasks := []string{}
+		_ = json.Unmarshal(subtasksJSON, &subtasks)
+
+		items = append(items, fiber.Map{
+			"id":      id,
+			"user_id": rowUserID,
+			"task_id": func() interface{} {
+				if taskID.Valid {
+					return taskID.Int64
+				}
+				return nil
+			}(),
+			"title_input":      titleInput,
+			"context":          contextText,
+			"source":           source,
+			"subtasks":         subtasks,
+			"applied":          applied,
+			"replace_existing": replaceExisting,
+			"created_at":       createdAt.UTC().Format(time.RFC3339),
+		})
+	}
+
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+
+	response := fiber.Map{
+		"items": items,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+	}
+	if hasTaskIDFilter {
+		response["task_id"] = taskIDFilter
 	}
 
 	return c.JSON(response)
