@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gofiber/fiber/v2"
+	"github.com/gofiber/fiber/v2/middleware/cors"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -195,6 +196,11 @@ func main() {
 	}
 
 	app := fiber.New()
+	app.Use(cors.New(cors.Config{
+		AllowOrigins: "*",
+		AllowHeaders: "Origin, Content-Type, Accept, Authorization",
+		AllowMethods: "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+	}))
 
 	app.Get("/api/v1/ping", func(c *fiber.Ctx) error {
 		return c.JSON(fiber.Map{

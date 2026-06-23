@@ -213,7 +213,7 @@ func processBatch(ctx context.Context, db *pgxpool.Pool, batchSize int, dispatch
 		  AND (s.next_attempt_at IS NULL OR s.next_attempt_at <= NOW())
 		ORDER BY s.trigger_at ASC, s.id ASC
 		LIMIT $1
-		FOR UPDATE SKIP LOCKED
+		FOR UPDATE OF s SKIP LOCKED
 	`, batchSize)
 	if err != nil {
 		return err
