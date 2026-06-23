@@ -405,6 +405,19 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_task_checklist_task_position ON task_checklist_items (task_id, position, id)`,
+		`CREATE TABLE IF NOT EXISTS task_ai_suggestions (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			task_id BIGINT REFERENCES tasks(id) ON DELETE SET NULL,
+			title_input TEXT NOT NULL,
+			context TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT 'ai-python',
+			subtasks JSONB NOT NULL,
+			applied BOOLEAN NOT NULL DEFAULT FALSE,
+			replace_existing BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_task_ai_suggestions_user_created ON task_ai_suggestions (user_id, created_at DESC)`,
 		`CREATE TABLE IF NOT EXISTS reminder_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1848,7 +1861,7 @@ func (a *appContext) handleDeleteTaskChecklistItem(c *fiber.Ctx) error {
 }
 
 func (a *appContext) handleDecomposeTask(c *fiber.Ctx) error {
-	_ = c.Locals("user_id").(int64)
+	userID := c.Locals("user_id").(int64)
 
 	var req taskDecomposeRequest
 	if err := c.BodyParser(&req); err != nil {
@@ -1868,10 +1881,26 @@ func (a *appContext) handleDecomposeTask(c *fiber.Ctx) error {
 		return c.Status(statusCode).JSON(fiber.Map{"error": err.Error()})
 	}
 
+	suggestionID := int64(0)
+	suggestionID, err = a.recordTaskAISuggestion(
+		ctx,
+		userID,
+		nil,
+		title,
+		req.Context,
+		cleanSubtasks,
+		false,
+		false,
+	)
+	if err != nil {
+		log.Printf("could not persist ai suggestion preview: %v", err)
+	}
+
 	return c.JSON(fiber.Map{
-		"title":    resolvedTitle,
-		"subtasks": cleanSubtasks,
-		"source":   "ai-python",
+		"title":         resolvedTitle,
+		"subtasks":      cleanSubtasks,
+		"source":        "ai-python",
+		"suggestion_id": suggestionID,
 	})
 }
 
@@ -1971,6 +2000,21 @@ func (a *appContext) handleDecomposeApplyTask(c *fiber.Ctx) error {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit checklist update"})
 	}
 
+	suggestionTaskID := taskID
+	suggestionID, err := a.recordTaskAISuggestion(
+		ctx,
+		userID,
+		&suggestionTaskID,
+		title,
+		req.Context,
+		subtasks,
+		true,
+		req.ReplaceExisting,
+	)
+	if err != nil {
+		log.Printf("could not persist ai suggestion apply: %v", err)
+	}
+
 	response, err := a.loadTaskResponse(ctx, userID, taskID)
 	if err != nil {
 		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load task"})
@@ -1979,6 +2023,7 @@ func (a *appContext) handleDecomposeApplyTask(c *fiber.Ctx) error {
 		"count":            len(subtasks),
 		"replace_existing": req.ReplaceExisting,
 		"source":           "ai-python",
+		"suggestion_id":    suggestionID,
 	}
 
 	return c.JSON(response)
@@ -2046,6 +2091,55 @@ func (a *appContext) decomposeTaskViaAI(ctx context.Context, title string, conte
 	}
 
 	return resolvedTitle, cleanSubtasks, fiber.StatusOK, nil
+}
+
+func (a *appContext) recordTaskAISuggestion(
+	ctx context.Context,
+	userID int64,
+	taskID *int64,
+	titleInput string,
+	contextText string,
+	subtasks []string,
+	applied bool,
+	replaceExisting bool,
+) (int64, error) {
+	titleInput = strings.TrimSpace(titleInput)
+	if titleInput == "" {
+		return 0, errors.New("title input is required")
+	}
+
+	contextText = strings.TrimSpace(contextText)
+
+	cleanSubtasks := make([]string, 0, len(subtasks))
+	for _, item := range subtasks {
+		trimmed := strings.TrimSpace(item)
+		if trimmed == "" {
+			continue
+		}
+		cleanSubtasks = append(cleanSubtasks, trimmed)
+	}
+	if len(cleanSubtasks) == 0 {
+		return 0, errors.New("subtasks cannot be empty")
+	}
+
+	subtasksJSON, err := json.Marshal(cleanSubtasks)
+	if err != nil {
+		return 0, err
+	}
+
+	var suggestionID int64
+	err = a.db.QueryRow(ctx, `
+		INSERT INTO task_ai_suggestions (
+			user_id, task_id, title_input, context, source, subtasks, applied, replace_existing
+		)
+		VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8)
+		RETURNING id
+	`, userID, taskID, titleInput, contextText, "ai-python", string(subtasksJSON), applied, replaceExisting).Scan(&suggestionID)
+	if err != nil {
+		return 0, err
+	}
+
+	return suggestionID, nil
 }
 
 func validateTaskRequest(req taskRequest) (string, string, string, string, interface{}, []string, *int64, error) {
