@@ -221,6 +221,45 @@ type financeTransactionRow struct {
 	CreatedAt   time.Time
 }
 
+type financeRecurringBillRequest struct {
+	Title     string  `json:"title"`
+	Category  string  `json:"category"`
+	Amount    float64 `json:"amount"`
+	DueDay    int     `json:"due_day"`
+	StartDate string  `json:"start_date"`
+	EndDate   string  `json:"end_date"`
+	IsActive  *bool   `json:"is_active"`
+}
+
+type financeRecurringBillRow struct {
+	ID                 int64
+	UserID             int64
+	Title              string
+	Category           string
+	Amount             float64
+	DueDay             int
+	StartDate          time.Time
+	EndDate            sql.NullTime
+	IsActive           bool
+	LastGeneratedMonth sql.NullTime
+	CreatedAt          time.Time
+	UpdatedAt          time.Time
+}
+
+type financeBillRow struct {
+	ID              int64
+	UserID          int64
+	RecurringBillID sql.NullInt64
+	Title           string
+	Category        string
+	Amount          float64
+	DueDate         time.Time
+	Status          string
+	PaidAt          sql.NullTime
+	CreatedAt       time.Time
+	UpdatedAt       time.Time
+}
+
 type gamificationSummary struct {
 	XP              int    `json:"xp"`
 	Level           int    `json:"level"`
@@ -308,6 +347,11 @@ func main() {
 	secured.Get("/finance/accounts", appCtx.handleListFinanceAccounts)
 	secured.Post("/finance/transactions", appCtx.handleCreateFinanceTransaction)
 	secured.Get("/finance/transactions", appCtx.handleListFinanceTransactions)
+	secured.Post("/finance/recurring-bills", appCtx.handleCreateFinanceRecurringBill)
+	secured.Get("/finance/recurring-bills", appCtx.handleListFinanceRecurringBills)
+	secured.Post("/finance/recurring-bills/:id/generate", appCtx.handleGenerateFinanceBills)
+	secured.Get("/finance/bills", appCtx.handleListFinanceBills)
+	secured.Patch("/finance/bills/:id/pay", appCtx.handlePayFinanceBill)
 	secured.Get("/finance/summary", appCtx.handleGetFinanceSummary)
 	secured.Get("/gamification/summary", appCtx.handleGetGamificationSummary)
 	secured.Get("/gamification/achievements", appCtx.handleGetAchievements)
@@ -493,6 +537,36 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_occurred ON finance_transactions (user_id, occurred_at DESC)`,
 		`CREATE INDEX IF NOT EXISTS idx_finance_transactions_user_kind ON finance_transactions (user_id, kind, occurred_at DESC)`,
+		`CREATE TABLE IF NOT EXISTS finance_recurring_bills (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			title TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT 'geral',
+			amount NUMERIC(14,2) NOT NULL,
+			due_day INTEGER NOT NULL CHECK (due_day BETWEEN 1 AND 31),
+			start_date DATE NOT NULL DEFAULT CURRENT_DATE,
+			end_date DATE,
+			is_active BOOLEAN NOT NULL DEFAULT TRUE,
+			last_generated_month DATE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_recurring_bills_user_active ON finance_recurring_bills (user_id, is_active, due_day)`,
+		`CREATE TABLE IF NOT EXISTS finance_bills (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			recurring_bill_id BIGINT REFERENCES finance_recurring_bills(id) ON DELETE SET NULL,
+			title TEXT NOT NULL,
+			category TEXT NOT NULL DEFAULT 'geral',
+			amount NUMERIC(14,2) NOT NULL,
+			due_date DATE NOT NULL,
+			status TEXT NOT NULL DEFAULT 'pending',
+			paid_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (user_id, recurring_bill_id, due_date)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_bills_user_due ON finance_bills (user_id, due_date, status)`,
 		`CREATE TABLE IF NOT EXISTS reminder_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -2551,6 +2625,391 @@ func (a *appContext) handleGetFinanceSummary(c *fiber.Ctx) error {
 	})
 }
 
+func (a *appContext) handleCreateFinanceRecurringBill(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	var req financeRecurringBillRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if len(title) < 2 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "title must be at least 2 characters"})
+	}
+
+	category := strings.TrimSpace(req.Category)
+	if category == "" {
+		category = "geral"
+	}
+
+	if req.Amount <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "amount must be greater than zero"})
+	}
+
+	if req.DueDay < 1 || req.DueDay > 31 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "due_day must be between 1 and 31"})
+	}
+
+	startDate, err := parseDateOnlyOrDefault(req.StartDate, dateOnlyUTC(time.Now().UTC()))
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "start_date must be YYYY-MM-DD"})
+	}
+
+	var endDate interface{} = nil
+	endDateRaw := strings.TrimSpace(req.EndDate)
+	if endDateRaw != "" {
+		parsedEnd, err := parseDateOnly(endDateRaw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_date must be YYYY-MM-DD"})
+		}
+		if parsedEnd.Before(startDate) {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "end_date must be on or after start_date"})
+		}
+		endDate = parsedEnd
+	}
+
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	var row financeRecurringBillRow
+	err = a.db.QueryRow(ctx, `
+			INSERT INTO finance_recurring_bills (user_id, title, category, amount, due_day, start_date, end_date, is_active)
+			VALUES ($1, $2, $3, ROUND($4::numeric, 2), $5, $6::date, $7::date, $8)
+			RETURNING id, user_id, title, category, amount::float8, due_day, start_date::timestamptz, end_date::timestamptz, is_active, last_generated_month::timestamptz, created_at, updated_at
+		`, userID, title, category, req.Amount, req.DueDay, startDate.Format("2006-01-02"), endDate, isActive).
+		Scan(&row.ID, &row.UserID, &row.Title, &row.Category, &row.Amount, &row.DueDay, &row.StartDate, &row.EndDate, &row.IsActive, &row.LastGeneratedMonth, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not create recurring bill"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(financeRecurringBillRowToResponse(row))
+}
+
+func (a *appContext) handleListFinanceRecurringBills(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	includeInactive := strings.EqualFold(strings.TrimSpace(c.Query("include_inactive")), "true") || strings.TrimSpace(c.Query("include_inactive")) == "1"
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	query := `
+			SELECT id, user_id, title, category, amount::float8, due_day, start_date::timestamptz, end_date::timestamptz, is_active, last_generated_month::timestamptz, created_at, updated_at
+			FROM finance_recurring_bills
+			WHERE user_id = $1
+		`
+	if !includeInactive {
+		query += ` AND is_active = TRUE`
+	}
+	query += ` ORDER BY due_day ASC, created_at DESC, id DESC`
+
+	rows, err := a.db.Query(ctx, query, userID)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list recurring bills"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row financeRecurringBillRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Title, &row.Category, &row.Amount, &row.DueDay, &row.StartDate, &row.EndDate, &row.IsActive, &row.LastGeneratedMonth, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse recurring bill"})
+		}
+		items = append(items, financeRecurringBillRowToResponse(row))
+	}
+
+	return c.JSON(fiber.Map{"recurring_bills": items})
+}
+
+func (a *appContext) handleGenerateFinanceBills(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	recurringID, err := strconv.ParseInt(strings.TrimSpace(c.Params("id")), 10, 64)
+	if err != nil || recurringID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid recurring bill id"})
+	}
+
+	monthsAhead := parsePositiveInt(c.Query("months_ahead"), 1)
+	if monthsAhead > 12 {
+		monthsAhead = 12
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 8*time.Second)
+	defer cancel()
+
+	var recurring financeRecurringBillRow
+	err = a.db.QueryRow(ctx, `
+			SELECT id, user_id, title, category, amount::float8, due_day, start_date::timestamptz, end_date::timestamptz, is_active, last_generated_month::timestamptz, created_at, updated_at
+			FROM finance_recurring_bills
+			WHERE id = $1 AND user_id = $2
+		`, recurringID, userID).
+		Scan(&recurring.ID, &recurring.UserID, &recurring.Title, &recurring.Category, &recurring.Amount, &recurring.DueDay, &recurring.StartDate, &recurring.EndDate, &recurring.IsActive, &recurring.LastGeneratedMonth, &recurring.CreatedAt, &recurring.UpdatedAt)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "recurring bill not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load recurring bill"})
+	}
+
+	if !recurring.IsActive {
+		return c.Status(fiber.StatusConflict).JSON(fiber.Map{"error": "recurring bill is inactive"})
+	}
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	startMonth := firstDayOfMonth(recurring.StartDate)
+	currentMonth := firstDayOfMonth(time.Now().UTC())
+	var endMonth time.Time
+	hasEnd := false
+	if recurring.EndDate.Valid {
+		hasEnd = true
+		endMonth = firstDayOfMonth(recurring.EndDate.Time)
+	}
+
+	generated := 0
+	processedMonths := 0
+	latestEligibleMonth := time.Time{}
+
+	for i := 0; i < monthsAhead; i++ {
+		month := currentMonth.AddDate(0, i, 0)
+		if month.Before(startMonth) {
+			continue
+		}
+		if hasEnd && month.After(endMonth) {
+			continue
+		}
+
+		latestEligibleMonth = month
+		processedMonths++
+		dueDate := dueDateForMonth(month, recurring.DueDay)
+
+		result, err := tx.Exec(ctx, `
+				INSERT INTO finance_bills (user_id, recurring_bill_id, title, category, amount, due_date, status)
+				VALUES ($1, $2, $3, $4, ROUND($5::numeric, 2), $6::date, 'pending')
+				ON CONFLICT (user_id, recurring_bill_id, due_date) DO NOTHING
+			`, userID, recurring.ID, recurring.Title, recurring.Category, recurring.Amount, dueDate.Format("2006-01-02"))
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not generate bills"})
+		}
+		if result.RowsAffected() > 0 {
+			generated++
+		}
+	}
+
+	if !latestEligibleMonth.IsZero() {
+		if _, err := tx.Exec(ctx, `
+				UPDATE finance_recurring_bills
+				SET last_generated_month = $1::date,
+					updated_at = NOW()
+				WHERE id = $2 AND user_id = $3
+			`, latestEligibleMonth.Format("2006-01-02"), recurring.ID, userID); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not update recurring bill generation state"})
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit bill generation"})
+	}
+
+	return c.JSON(fiber.Map{
+		"recurring_bill_id": recurring.ID,
+		"generated_count":   generated,
+		"processed_months":  processedMonths,
+		"months_ahead":      monthsAhead,
+	})
+}
+
+func (a *appContext) handleListFinanceBills(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	page := parsePositiveInt(c.Query("page"), 1)
+	limit := parsePositiveInt(c.Query("limit"), 20)
+	if limit > 100 {
+		limit = 100
+	}
+	offset := (page - 1) * limit
+
+	statusFilter := ""
+	if raw := strings.TrimSpace(c.Query("status")); raw != "" {
+		status, err := normalizeFinanceBillStatus(raw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": err.Error()})
+		}
+		statusFilter = status
+	}
+
+	fromDate := ""
+	if raw := strings.TrimSpace(c.Query("from")); raw != "" {
+		parsed, err := parseDateOnly(raw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "from must be YYYY-MM-DD"})
+		}
+		fromDate = parsed.Format("2006-01-02")
+	}
+
+	toDate := ""
+	if raw := strings.TrimSpace(c.Query("to")); raw != "" {
+		parsed, err := parseDateOnly(raw)
+		if err != nil {
+			return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "to must be YYYY-MM-DD"})
+		}
+		toDate = parsed.Format("2006-01-02")
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	where := " WHERE user_id = $1"
+	args := []interface{}{userID}
+	argPos := 2
+
+	if statusFilter == "overdue" {
+		where += " AND status = 'pending' AND due_date < CURRENT_DATE"
+	} else if statusFilter != "" {
+		where += fmt.Sprintf(" AND status = $%d", argPos)
+		args = append(args, statusFilter)
+		argPos++
+	}
+
+	if fromDate != "" {
+		where += fmt.Sprintf(" AND due_date >= $%d::date", argPos)
+		args = append(args, fromDate)
+		argPos++
+	}
+
+	if toDate != "" {
+		where += fmt.Sprintf(" AND due_date <= $%d::date", argPos)
+		args = append(args, toDate)
+		argPos++
+	}
+
+	var total int
+	if err := a.db.QueryRow(ctx, "SELECT COUNT(*) FROM finance_bills"+where, args...).Scan(&total); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not count bills"})
+	}
+
+	query := `
+			SELECT id, user_id, recurring_bill_id, title, category, amount::float8, due_date::timestamptz, status, paid_at, created_at, updated_at
+			FROM finance_bills
+		` + where + fmt.Sprintf(" ORDER BY due_date ASC, id DESC LIMIT $%d OFFSET $%d", argPos, argPos+1)
+	args = append(args, limit, offset)
+
+	rows, err := a.db.Query(ctx, query, args...)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list bills"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row financeBillRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.RecurringBillID, &row.Title, &row.Category, &row.Amount, &row.DueDate, &row.Status, &row.PaidAt, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse bill"})
+		}
+		items = append(items, financeBillRowToResponse(row))
+	}
+
+	totalPages := 0
+	if total > 0 {
+		totalPages = (total + limit - 1) / limit
+	}
+
+	return c.JSON(fiber.Map{
+		"bills": items,
+		"pagination": fiber.Map{
+			"page":        page,
+			"limit":       limit,
+			"total":       total,
+			"total_pages": totalPages,
+		},
+	})
+}
+
+func (a *appContext) handlePayFinanceBill(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+	billID, err := strconv.ParseInt(strings.TrimSpace(c.Params("id")), 10, 64)
+	if err != nil || billID <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid bill id"})
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	tx, err := a.db.Begin(ctx)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not start transaction"})
+	}
+	defer tx.Rollback(ctx)
+
+	var row financeBillRow
+	err = tx.QueryRow(ctx, `
+			SELECT id, user_id, recurring_bill_id, title, category, amount::float8, due_date::timestamptz, status, paid_at, created_at, updated_at
+			FROM finance_bills
+			WHERE id = $1 AND user_id = $2
+			FOR UPDATE
+		`, billID, userID).Scan(
+		&row.ID,
+		&row.UserID,
+		&row.RecurringBillID,
+		&row.Title,
+		&row.Category,
+		&row.Amount,
+		&row.DueDate,
+		&row.Status,
+		&row.PaidAt,
+		&row.CreatedAt,
+		&row.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) || strings.Contains(err.Error(), "no rows") {
+			return c.Status(fiber.StatusNotFound).JSON(fiber.Map{"error": "bill not found"})
+		}
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load bill"})
+	}
+
+	alreadyPaid := strings.EqualFold(row.Status, "paid")
+	if !alreadyPaid {
+		err = tx.QueryRow(ctx, `
+				UPDATE finance_bills
+				SET status = 'paid',
+					paid_at = COALESCE(paid_at, NOW()),
+					updated_at = NOW()
+				WHERE id = $1 AND user_id = $2
+				RETURNING id, user_id, recurring_bill_id, title, category, amount::float8, due_date::timestamptz, status, paid_at, created_at, updated_at
+			`, billID, userID).Scan(
+			&row.ID,
+			&row.UserID,
+			&row.RecurringBillID,
+			&row.Title,
+			&row.Category,
+			&row.Amount,
+			&row.DueDate,
+			&row.Status,
+			&row.PaidAt,
+			&row.CreatedAt,
+			&row.UpdatedAt,
+		)
+		if err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not mark bill as paid"})
+		}
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not commit bill payment"})
+	}
+
+	response := financeBillRowToResponse(row)
+	response["already_paid"] = alreadyPaid
+	return c.JSON(response)
+}
+
 func (a *appContext) decomposeTaskViaAI(ctx context.Context, title string, contextText string) (string, []string, int, error) {
 	title = strings.TrimSpace(title)
 	if len(title) < 3 {
@@ -2634,6 +3093,14 @@ func normalizeFinanceAccountType(raw string) (string, error) {
 	return t, nil
 }
 
+func normalizeFinanceBillStatus(raw string) (string, error) {
+	status := strings.ToLower(strings.TrimSpace(raw))
+	if status != "pending" && status != "paid" && status != "overdue" {
+		return "", errors.New("status must be pending, paid or overdue")
+	}
+	return status, nil
+}
+
 func financeAccountRowToResponse(row financeAccountRow) fiber.Map {
 	return fiber.Map{
 		"id":           row.ID,
@@ -2661,6 +3128,97 @@ func financeTransactionRowToResponse(row financeTransactionRow) fiber.Map {
 		"occurred_at": row.OccurredAt.UTC().Format(time.RFC3339),
 		"created_at":  row.CreatedAt.UTC().Format(time.RFC3339),
 	}
+}
+
+func financeRecurringBillRowToResponse(row financeRecurringBillRow) fiber.Map {
+	endDate := interface{}(nil)
+	if row.EndDate.Valid {
+		endDate = row.EndDate.Time.UTC().Format("2006-01-02")
+	}
+
+	lastGeneratedMonth := interface{}(nil)
+	if row.LastGeneratedMonth.Valid {
+		lastGeneratedMonth = firstDayOfMonth(row.LastGeneratedMonth.Time).Format("2006-01")
+	}
+
+	return fiber.Map{
+		"id":                   row.ID,
+		"user_id":              row.UserID,
+		"title":                row.Title,
+		"category":             row.Category,
+		"amount":               row.Amount,
+		"due_day":              row.DueDay,
+		"start_date":           row.StartDate.UTC().Format("2006-01-02"),
+		"end_date":             endDate,
+		"is_active":            row.IsActive,
+		"last_generated_month": lastGeneratedMonth,
+		"created_at":           row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":           row.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func financeBillRowToResponse(row financeBillRow) fiber.Map {
+	effectiveStatus := strings.ToLower(strings.TrimSpace(row.Status))
+	if effectiveStatus == "pending" && dateOnlyUTC(row.DueDate).Before(dateOnlyUTC(time.Now().UTC())) {
+		effectiveStatus = "overdue"
+	}
+
+	return fiber.Map{
+		"id":                row.ID,
+		"user_id":           row.UserID,
+		"recurring_bill_id": nullableInt64(row.RecurringBillID),
+		"title":             row.Title,
+		"category":          row.Category,
+		"amount":            row.Amount,
+		"due_date":          row.DueDate.UTC().Format("2006-01-02"),
+		"status":            row.Status,
+		"effective_status":  effectiveStatus,
+		"paid_at":           nullableTimeRFC3339(row.PaidAt),
+		"created_at":        row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":        row.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
+func parseDateOnly(value string) (time.Time, error) {
+	return time.Parse("2006-01-02", strings.TrimSpace(value))
+}
+
+func parseDateOnlyOrDefault(value string, fallback time.Time) (time.Time, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return dateOnlyUTC(fallback), nil
+	}
+	parsed, err := parseDateOnly(trimmed)
+	if err != nil {
+		return time.Time{}, err
+	}
+	return dateOnlyUTC(parsed), nil
+}
+
+func dateOnlyUTC(t time.Time) time.Time {
+	utc := t.UTC()
+	return time.Date(utc.Year(), utc.Month(), utc.Day(), 0, 0, 0, 0, time.UTC)
+}
+
+func firstDayOfMonth(t time.Time) time.Time {
+	base := dateOnlyUTC(t)
+	return time.Date(base.Year(), base.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+func dueDateForMonth(monthStart time.Time, dueDay int) time.Time {
+	monthStart = firstDayOfMonth(monthStart)
+	if dueDay < 1 {
+		dueDay = 1
+	}
+	maxDay := daysInMonth(monthStart.Year(), monthStart.Month())
+	if dueDay > maxDay {
+		dueDay = maxDay
+	}
+	return time.Date(monthStart.Year(), monthStart.Month(), dueDay, 0, 0, 0, 0, time.UTC)
+}
+
+func daysInMonth(year int, month time.Month) int {
+	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
 }
 
 func (a *appContext) recordTaskAISuggestion(
