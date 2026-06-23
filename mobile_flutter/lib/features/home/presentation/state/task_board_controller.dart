@@ -209,6 +209,33 @@ class TaskBoardController extends ChangeNotifier {
     await load();
   }
 
+  Future<void> applyAiChecklist({
+    required int taskId,
+    String? title,
+    String? context,
+    bool replaceExisting = false,
+  }) async {
+    final payload = <String, dynamic>{'replace_existing': replaceExisting};
+
+    final trimmedTitle = title?.trim() ?? '';
+    if (trimmedTitle.isNotEmpty) {
+      payload['title'] = trimmedTitle;
+    }
+
+    final trimmedContext = context?.trim() ?? '';
+    if (trimmedContext.isNotEmpty) {
+      payload['context'] = trimmedContext;
+    }
+
+    final response = await apiClient.post(
+      '/api/v1/tasks/$taskId/decompose-apply',
+      requiresAuth: true,
+      body: payload,
+    );
+    _requireSuccess(response.statusCode, action: 'aplicar checklist com IA');
+    await load();
+  }
+
   TaskItem? taskById(int taskId) {
     for (final task in _tasks) {
       if (task.id == taskId) {

@@ -54,6 +54,8 @@ class _TasksPageState extends State<TasksPage> {
                   task: task,
                   onEdit: () => _openTaskDialog(context, existingTask: task),
                   onDelete: () => _deleteTask(context, task),
+                  onGenerateChecklistAi: () =>
+                      _generateChecklistWithAi(context, task),
                   onAddChecklistItem: () => _addChecklistItem(context, task),
                   onToggleChecklistItem: (itemId) =>
                       widget.controller.toggleChecklistItem(task.id, itemId),
@@ -146,6 +148,34 @@ class _TasksPageState extends State<TasksPage> {
 
     await widget.controller.addChecklistItem(task.id, result);
   }
+
+  Future<void> _generateChecklistWithAi(
+    BuildContext context,
+    TaskItem task,
+  ) async {
+    final request = await showDialog<_AiChecklistRequest>(
+      context: context,
+      builder: (dialogContext) => _AiChecklistDialog(task: task),
+    );
+
+    if (request == null) {
+      return;
+    }
+
+    await widget.controller.applyAiChecklist(
+      taskId: task.id,
+      context: request.context,
+      replaceExisting: request.replaceExisting,
+    );
+
+    if (!context.mounted) {
+      return;
+    }
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Checklist gerado com IA com sucesso.')),
+    );
+  }
 }
 
 class _TaskCard extends StatelessWidget {
@@ -153,6 +183,7 @@ class _TaskCard extends StatelessWidget {
     required this.task,
     required this.onEdit,
     required this.onDelete,
+    required this.onGenerateChecklistAi,
     required this.onAddChecklistItem,
     required this.onToggleChecklistItem,
     required this.onDeleteChecklistItem,
@@ -161,6 +192,7 @@ class _TaskCard extends StatelessWidget {
   final TaskItem task;
   final VoidCallback onEdit;
   final VoidCallback onDelete;
+  final VoidCallback onGenerateChecklistAi;
   final VoidCallback onAddChecklistItem;
   final void Function(int checklistItemId) onToggleChecklistItem;
   final void Function(int checklistItemId) onDeleteChecklistItem;
@@ -276,6 +308,9 @@ class _TaskCard extends StatelessWidget {
                 PopupMenuButton<String>(
                   onSelected: (value) {
                     switch (value) {
+                      case 'ai':
+                        onGenerateChecklistAi();
+                        break;
                       case 'edit':
                         onEdit();
                         break;
@@ -285,6 +320,10 @@ class _TaskCard extends StatelessWidget {
                     }
                   },
                   itemBuilder: (context) => const [
+                    PopupMenuItem(
+                      value: 'ai',
+                      child: Text('Gerar checklist IA'),
+                    ),
                     PopupMenuItem(value: 'edit', child: Text('Editar')),
                     PopupMenuItem(value: 'delete', child: Text('Excluir')),
                   ],
@@ -303,10 +342,21 @@ class _TaskCard extends StatelessWidget {
             Text('$percent% concluido'),
             const SizedBox(height: 12),
             if (task.checklist.isEmpty)
-              TextButton.icon(
-                onPressed: task.isBlocked ? null : onAddChecklistItem,
-                icon: const Icon(Icons.playlist_add_rounded),
-                label: const Text('Adicionar checklist'),
+              Wrap(
+                spacing: 8,
+                runSpacing: 8,
+                children: [
+                  TextButton.icon(
+                    onPressed: task.isBlocked ? null : onAddChecklistItem,
+                    icon: const Icon(Icons.playlist_add_rounded),
+                    label: const Text('Adicionar checklist'),
+                  ),
+                  TextButton.icon(
+                    onPressed: task.isBlocked ? null : onGenerateChecklistAi,
+                    icon: const Icon(Icons.auto_awesome_rounded),
+                    label: const Text('Gerar com IA'),
+                  ),
+                ],
               )
             else
               Column(
@@ -350,10 +400,23 @@ class _TaskCard extends StatelessWidget {
                     ),
                   Align(
                     alignment: Alignment.centerLeft,
-                    child: TextButton.icon(
-                      onPressed: task.isBlocked ? null : onAddChecklistItem,
-                      icon: const Icon(Icons.playlist_add_rounded),
-                      label: const Text('Adicionar item'),
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      children: [
+                        TextButton.icon(
+                          onPressed: task.isBlocked ? null : onAddChecklistItem,
+                          icon: const Icon(Icons.playlist_add_rounded),
+                          label: const Text('Adicionar item'),
+                        ),
+                        TextButton.icon(
+                          onPressed: task.isBlocked
+                              ? null
+                              : onGenerateChecklistAi,
+                          icon: const Icon(Icons.auto_awesome_rounded),
+                          label: const Text('Expandir com IA'),
+                        ),
+                      ],
                     ),
                   ),
                 ],
@@ -415,6 +478,91 @@ class _EmptyTaskCard extends StatelessWidget {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AiChecklistRequest {
+  const _AiChecklistRequest({
+    required this.context,
+    required this.replaceExisting,
+  });
+
+  final String context;
+  final bool replaceExisting;
+}
+
+class _AiChecklistDialog extends StatefulWidget {
+  const _AiChecklistDialog({required this.task});
+
+  final TaskItem task;
+
+  @override
+  State<_AiChecklistDialog> createState() => _AiChecklistDialogState();
+}
+
+class _AiChecklistDialogState extends State<_AiChecklistDialog> {
+  final _contextController = TextEditingController();
+  late bool _replaceExisting;
+
+  @override
+  void initState() {
+    super.initState();
+    _replaceExisting = widget.task.checklist.isNotEmpty;
+  }
+
+  @override
+  void dispose() {
+    _contextController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Gerar checklist com IA'),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text('Tarefa: ${widget.task.title}'),
+          const SizedBox(height: 12),
+          TextField(
+            controller: _contextController,
+            maxLines: 3,
+            decoration: const InputDecoration(
+              labelText: 'Contexto opcional',
+              hintText: 'Ex.: prazo em 2 dias, foco em passos curtos',
+            ),
+          ),
+          const SizedBox(height: 12),
+          SwitchListTile.adaptive(
+            contentPadding: EdgeInsets.zero,
+            value: _replaceExisting,
+            onChanged: (value) => setState(() => _replaceExisting = value),
+            title: const Text('Substituir checklist atual'),
+            subtitle: const Text('Desative para apenas adicionar novos itens.'),
+          ),
+        ],
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('Cancelar'),
+        ),
+        FilledButton.icon(
+          onPressed: () {
+            Navigator.of(context).pop(
+              _AiChecklistRequest(
+                context: _contextController.text,
+                replaceExisting: _replaceExisting,
+              ),
+            );
+          },
+          icon: const Icon(Icons.auto_awesome_rounded),
+          label: const Text('Gerar'),
+        ),
+      ],
     );
   }
 }
