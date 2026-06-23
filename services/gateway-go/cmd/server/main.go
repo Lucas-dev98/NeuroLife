@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
@@ -260,6 +261,26 @@ type financeBillRow struct {
 	UpdatedAt       time.Time
 }
 
+type financeBudgetRequest struct {
+	Category    string  `json:"category"`
+	LimitAmount float64 `json:"limit_amount"`
+	MonthRef    string  `json:"month_ref"`
+	AlertPct    int     `json:"alert_pct"`
+	IsActive    *bool   `json:"is_active"`
+}
+
+type financeBudgetRow struct {
+	ID          int64
+	UserID      int64
+	Category    string
+	LimitAmount float64
+	MonthRef    time.Time
+	AlertPct    int
+	IsActive    bool
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
 type gamificationSummary struct {
 	XP              int    `json:"xp"`
 	Level           int    `json:"level"`
@@ -352,6 +373,9 @@ func main() {
 	secured.Post("/finance/recurring-bills/:id/generate", appCtx.handleGenerateFinanceBills)
 	secured.Get("/finance/bills", appCtx.handleListFinanceBills)
 	secured.Patch("/finance/bills/:id/pay", appCtx.handlePayFinanceBill)
+	secured.Post("/finance/budgets", appCtx.handleCreateFinanceBudget)
+	secured.Get("/finance/budgets", appCtx.handleListFinanceBudgets)
+	secured.Get("/finance/budgets/summary", appCtx.handleFinanceBudgetSummary)
 	secured.Get("/finance/summary", appCtx.handleGetFinanceSummary)
 	secured.Get("/gamification/summary", appCtx.handleGetGamificationSummary)
 	secured.Get("/gamification/achievements", appCtx.handleGetAchievements)
@@ -567,6 +591,19 @@ func runMigrations(ctx context.Context, db *pgxpool.Pool) error {
 			UNIQUE (user_id, recurring_bill_id, due_date)
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_finance_bills_user_due ON finance_bills (user_id, due_date, status)`,
+		`CREATE TABLE IF NOT EXISTS finance_budgets (
+			id BIGSERIAL PRIMARY KEY,
+			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			category TEXT NOT NULL,
+			limit_amount NUMERIC(14,2) NOT NULL,
+			month_ref DATE NOT NULL,
+			alert_pct INTEGER NOT NULL DEFAULT 80,
+			is_active BOOLEAN NOT NULL DEFAULT TRUE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			UNIQUE (user_id, category, month_ref)
+		)`,
+		`CREATE INDEX IF NOT EXISTS idx_finance_budgets_user_month ON finance_budgets (user_id, month_ref, category)`,
 		`CREATE TABLE IF NOT EXISTS reminder_outbox (
 			id BIGSERIAL PRIMARY KEY,
 			user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -3010,6 +3047,201 @@ func (a *appContext) handlePayFinanceBill(c *fiber.Ctx) error {
 	return c.JSON(response)
 }
 
+func (a *appContext) handleCreateFinanceBudget(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	var req financeBudgetRequest
+	if err := c.BodyParser(&req); err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "invalid request body"})
+	}
+
+	category := strings.ToLower(strings.TrimSpace(req.Category))
+	if category == "" {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "category is required"})
+	}
+
+	if req.LimitAmount <= 0 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "limit_amount must be greater than zero"})
+	}
+
+	monthRef, err := parseMonthRef(req.MonthRef)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "month_ref must be YYYY-MM"})
+	}
+
+	alertPct := req.AlertPct
+	if alertPct == 0 {
+		alertPct = 80
+	}
+	if alertPct < 1 || alertPct > 200 {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "alert_pct must be between 1 and 200"})
+	}
+
+	isActive := true
+	if req.IsActive != nil {
+		isActive = *req.IsActive
+	}
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	var row financeBudgetRow
+	err = a.db.QueryRow(ctx, `
+		INSERT INTO finance_budgets (user_id, category, limit_amount, month_ref, alert_pct, is_active)
+		VALUES ($1, $2, ROUND($3::numeric, 2), $4::date, $5, $6)
+		ON CONFLICT (user_id, category, month_ref)
+		DO UPDATE SET
+			limit_amount = EXCLUDED.limit_amount,
+			alert_pct = EXCLUDED.alert_pct,
+			is_active = EXCLUDED.is_active,
+			updated_at = NOW()
+		RETURNING id, user_id, category, limit_amount::float8, month_ref::timestamptz, alert_pct, is_active, created_at, updated_at
+	`, userID, category, req.LimitAmount, monthRef.Format("2006-01-02"), alertPct, isActive).
+		Scan(&row.ID, &row.UserID, &row.Category, &row.LimitAmount, &row.MonthRef, &row.AlertPct, &row.IsActive, &row.CreatedAt, &row.UpdatedAt)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not upsert budget"})
+	}
+
+	return c.Status(fiber.StatusCreated).JSON(financeBudgetRowToResponse(row))
+}
+
+func (a *appContext) handleListFinanceBudgets(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	monthRefRaw := strings.TrimSpace(c.Query("month_ref"))
+	monthRef, err := parseMonthRefOrCurrent(monthRefRaw)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "month_ref must be YYYY-MM"})
+	}
+
+	includeInactive := strings.EqualFold(strings.TrimSpace(c.Query("include_inactive")), "true") || strings.TrimSpace(c.Query("include_inactive")) == "1"
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	query := `
+		SELECT id, user_id, category, limit_amount::float8, month_ref::timestamptz, alert_pct, is_active, created_at, updated_at
+		FROM finance_budgets
+		WHERE user_id = $1 AND month_ref = $2::date
+	`
+	if !includeInactive {
+		query += ` AND is_active = TRUE`
+	}
+	query += ` ORDER BY category ASC`
+
+	rows, err := a.db.Query(ctx, query, userID, monthRef.Format("2006-01-02"))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not list budgets"})
+	}
+	defer rows.Close()
+
+	items := make([]fiber.Map, 0)
+	for rows.Next() {
+		var row financeBudgetRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Category, &row.LimitAmount, &row.MonthRef, &row.AlertPct, &row.IsActive, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse budget"})
+		}
+		items = append(items, financeBudgetRowToResponse(row))
+	}
+
+	return c.JSON(fiber.Map{
+		"month_ref": monthRef.Format("2006-01"),
+		"budgets":   items,
+	})
+}
+
+func (a *appContext) handleFinanceBudgetSummary(c *fiber.Ctx) error {
+	userID := c.Locals("user_id").(int64)
+
+	monthRefRaw := strings.TrimSpace(c.Query("month_ref"))
+	monthRef, err := parseMonthRefOrCurrent(monthRefRaw)
+	if err != nil {
+		return c.Status(fiber.StatusBadRequest).JSON(fiber.Map{"error": "month_ref must be YYYY-MM"})
+	}
+
+	monthStart := firstDayOfMonth(monthRef)
+	nextMonth := monthStart.AddDate(0, 1, 0)
+
+	ctx, cancel := context.WithTimeout(c.UserContext(), 5*time.Second)
+	defer cancel()
+
+	rows, err := a.db.Query(ctx, `
+		SELECT id, user_id, category, limit_amount::float8, month_ref::timestamptz, alert_pct, is_active, created_at, updated_at
+		FROM finance_budgets
+		WHERE user_id = $1 AND month_ref = $2::date AND is_active = TRUE
+		ORDER BY category ASC
+	`, userID, monthStart.Format("2006-01-02"))
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load budgets"})
+	}
+	defer rows.Close()
+
+	budgets := make([]financeBudgetRow, 0)
+	for rows.Next() {
+		var row financeBudgetRow
+		if err := rows.Scan(&row.ID, &row.UserID, &row.Category, &row.LimitAmount, &row.MonthRef, &row.AlertPct, &row.IsActive, &row.CreatedAt, &row.UpdatedAt); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse budgets"})
+		}
+		budgets = append(budgets, row)
+	}
+
+	expenseRows, err := a.db.Query(ctx, `
+		SELECT category, COALESCE(SUM(amount), 0)::float8 AS spent
+		FROM finance_transactions
+		WHERE user_id = $1
+		  AND kind = 'expense'
+		  AND occurred_at >= $2
+		  AND occurred_at < $3
+		GROUP BY category
+	`, userID, monthStart, nextMonth)
+	if err != nil {
+		return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not load monthly expenses"})
+	}
+	defer expenseRows.Close()
+
+	spentByCategory := map[string]float64{}
+	for expenseRows.Next() {
+		var category string
+		var spent float64
+		if err := expenseRows.Scan(&category, &spent); err != nil {
+			return c.Status(fiber.StatusInternalServerError).JSON(fiber.Map{"error": "could not parse monthly expenses"})
+		}
+		spentByCategory[strings.ToLower(strings.TrimSpace(category))] = spent
+	}
+
+	items := make([]fiber.Map, 0, len(budgets))
+	for _, b := range budgets {
+		spent := spentByCategory[b.Category]
+		usagePct := 0.0
+		remaining := b.LimitAmount
+		if b.LimitAmount > 0 {
+			usagePct = (spent / b.LimitAmount) * 100.0
+			remaining = b.LimitAmount - spent
+		}
+
+		status := "ok"
+		if usagePct >= 100 {
+			status = "exceeded"
+		} else if usagePct >= float64(b.AlertPct) {
+			status = "alert"
+		}
+
+		items = append(items, fiber.Map{
+			"budget":            financeBudgetRowToResponse(b),
+			"spent":             roundCurrency(spent),
+			"remaining":         roundCurrency(remaining),
+			"usage_pct":         roundCurrency(usagePct),
+			"status":            status,
+			"alert_trigger_pct": b.AlertPct,
+		})
+	}
+
+	return c.JSON(fiber.Map{
+		"month_ref": monthStart.Format("2006-01"),
+		"items":     items,
+	})
+}
+
 func (a *appContext) decomposeTaskViaAI(ctx context.Context, title string, contextText string) (string, []string, int, error) {
 	title = strings.TrimSpace(title)
 	if len(title) < 3 {
@@ -3101,6 +3333,22 @@ func normalizeFinanceBillStatus(raw string) (string, error) {
 	return status, nil
 }
 
+func parseMonthRef(value string) (time.Time, error) {
+	parsed, err := time.Parse("2006-01", strings.TrimSpace(value))
+	if err != nil {
+		return time.Time{}, err
+	}
+	return firstDayOfMonth(parsed), nil
+}
+
+func parseMonthRefOrCurrent(value string) (time.Time, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return firstDayOfMonth(time.Now().UTC()), nil
+	}
+	return parseMonthRef(trimmed)
+}
+
 func financeAccountRowToResponse(row financeAccountRow) fiber.Map {
 	return fiber.Map{
 		"id":           row.ID,
@@ -3179,6 +3427,20 @@ func financeBillRowToResponse(row financeBillRow) fiber.Map {
 	}
 }
 
+func financeBudgetRowToResponse(row financeBudgetRow) fiber.Map {
+	return fiber.Map{
+		"id":           row.ID,
+		"user_id":      row.UserID,
+		"category":     row.Category,
+		"limit_amount": row.LimitAmount,
+		"month_ref":    firstDayOfMonth(row.MonthRef).Format("2006-01"),
+		"alert_pct":    row.AlertPct,
+		"is_active":    row.IsActive,
+		"created_at":   row.CreatedAt.UTC().Format(time.RFC3339),
+		"updated_at":   row.UpdatedAt.UTC().Format(time.RFC3339),
+	}
+}
+
 func parseDateOnly(value string) (time.Time, error) {
 	return time.Parse("2006-01-02", strings.TrimSpace(value))
 }
@@ -3219,6 +3481,10 @@ func dueDateForMonth(monthStart time.Time, dueDay int) time.Time {
 
 func daysInMonth(year int, month time.Month) int {
 	return time.Date(year, month+1, 0, 0, 0, 0, 0, time.UTC).Day()
+}
+
+func roundCurrency(v float64) float64 {
+	return math.Round(v*100) / 100
 }
 
 func (a *appContext) recordTaskAISuggestion(
